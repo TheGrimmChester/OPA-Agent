@@ -25,18 +25,27 @@ type ServiceMapProcessor struct {
 	mu           sync.RWMutex
 	queryClient  *ClickHouseQuery
 	writer       *ClickHouseWriter
+	clickhouseURL string
 	orgID        string
 	projectID    string
 }
 
 func NewServiceMapProcessor(queryClient *ClickHouseQuery, writer *ClickHouseWriter, orgID, projectID string) *ServiceMapProcessor {
+	// Extract URL from queryClient - we'll need to pass it or get it from writer
+	// For now, we'll store it when we have access to it
 	return &ServiceMapProcessor{
 		dependencies: make(map[string]*ServiceDependency),
 		queryClient:  queryClient,
 		writer:       writer,
+		clickhouseURL: "", // Will be set via SetURL if needed
 		orgID:        orgID,
 		projectID:    projectID,
 	}
+}
+
+// SetURL sets the ClickHouse URL (called during initialization)
+func (smp *ServiceMapProcessor) SetURL(url string) {
+	smp.clickhouseURL = url
 }
 
 // Process span to extract service dependencies
@@ -115,8 +124,15 @@ func (smp *ServiceMapProcessor) Flush() {
 
 		// Write to service_dependencies table via HTTP
 		jsonData, _ := json.Marshal(row)
+		// Use the same approach as ClickHouseWriter - POST with data in body
+		baseURL := smp.clickhouseURL
+		if baseURL == "" {
+			// Fallback: try to get from queryClient (we need to store it)
+			// For now, skip if URL not set
+			continue
+		}
 		url := fmt.Sprintf("%s/?query=INSERT%%20INTO%%20opa.service_dependencies%%20FORMAT%%20JSONEachRow", 
-			strings.TrimRight(smp.writer.url, "/"))
+			strings.TrimRight(baseURL, "/"))
 		req, _ := http.NewRequest("POST", url, bytes.NewReader(jsonData))
 		req.Header.Set("Content-Type", "application/json")
 		client := &http.Client{Timeout: 10 * time.Second}
@@ -140,7 +156,14 @@ func (smp *ServiceMapProcessor) UpdateMetadata() {
 	smp.mu.RLock()
 	defer smp.mu.RUnlock()
 
+	if len(smp.dependencies) == 0 {
+		return // No dependencies to update
+	}
+
 	for _, dep := range smp.dependencies {
+		if dep.CallCount == 0 {
+			continue // Skip empty dependencies
+		}
 		avgDuration := dep.TotalDuration / float64(dep.CallCount)
 		errorRate := float64(dep.ErrorCount) / float64(dep.CallCount) * 100.0
 
