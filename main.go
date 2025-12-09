@@ -4377,12 +4377,14 @@ var (
 
 func handleConn(conn net.Conn, inCh chan<- json.RawMessage) {
 	defer conn.Close()
+	log.Printf("[DEBUG] New connection from: %s", conn.RemoteAddr())
 	scanner := bufio.NewScanner(conn)
 	buf := make([]byte, 0, 64*1024)
 	scanner.Buffer(buf, 10*1024*1024)
 	
 	for scanner.Scan() {
 		line := scanner.Bytes()
+		log.Printf("[DEBUG] Received line from %s: %d bytes", conn.RemoteAddr(), len(line))
 		incomingCounter.Inc()
 		
 		// Decompress if needed
@@ -4504,6 +4506,7 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 	for raw := range inCh {
 		start := time.Now()
 		atomic.AddInt64(&currentQueueSize, -1)
+		log.Printf("[DEBUG] Worker received message: %d bytes", len(raw))
 		
 		if !breaker.Allow() {
 			droppedCounter.Inc()
@@ -4534,6 +4537,8 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 			breaker.RecordFailure()
 			continue
 		}
+		log.Printf("[DEBUG] Parsed incoming span: trace_id=%s, span_id=%s, service=%s, stack_len=%d, sql_len=%d", 
+			inc.TraceID, inc.SpanID, inc.Service, len(inc.Stack), len(inc.Sql))
 		
 		if len(inc.Tags) > 0 {
 			hasHttpRequest := strings.Contains(string(inc.Tags), "\"http_request\"") || strings.Contains(string(inc.Tags), "http_request")
@@ -4557,6 +4562,7 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 			// Use proper random sampling instead of time-based
 			// This ensures uniform distribution across requests
 			if rand.Float64() > rate {
+				log.Printf("[DEBUG] Message dropped due to sampling: rate=%.3f", rate)
 				continue
 			}
 		}
@@ -4729,12 +4735,37 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 		
 		writer.Add(min)
 		
-		// Store full span if trace should be kept OR if call stack is present
-		// This ensures call stack is always stored when available
+		// Store full span if trace should be kept OR if call stack is present OR if there's any profiling data
+		// This ensures call stack is always stored when available, and also stores spans with SQL/HTTP/cache/Redis data even without call stack
+		// IMPORTANT: Always store full spans to ensure profiling data is captured even when call stack is empty
 		hasCallStack := len(inc.Stack) > 0
 		// Also write full data if dumps are present (dumps are important and should always be stored)
 		hasDumps := len(inc.Dumps) > 0 && string(inc.Dumps) != "[]" && string(inc.Dumps) != "null"
-		if tb.ShouldKeep(inc.TraceID) || inc.ChunkDone != nil && *inc.ChunkDone || hasCallStack || hasDumps {
+		// Check for profiling data in direct fields (backward compatibility - SQL/HTTP/cache/Redis can be in direct fields even without call stack)
+		hasSqlData := len(inc.Sql) > 0 && string(inc.Sql) != "[]" && string(inc.Sql) != "null"
+		hasHttpData := len(inc.Http) > 0 && string(inc.Http) != "[]" && string(inc.Http) != "null"
+		hasCacheData := len(inc.Cache) > 0 && string(inc.Cache) != "[]" && string(inc.Cache) != "null"
+		hasRedisData := len(inc.Redis) > 0 && string(inc.Redis) != "[]" && string(inc.Redis) != "null"
+		
+		// Also check if call stack contains profiling data (SQL/HTTP/cache/Redis in call nodes)
+		hasProfilingDataInStack := false
+		if len(inc.Stack) > 0 {
+			callStack := parseCallStack(inc.Stack)
+			// Check if any call node has SQL queries, HTTP requests, cache operations, or Redis operations
+			for _, node := range callStack {
+				if len(node.SQLQueries) > 0 || len(node.HttpRequests) > 0 || len(node.CacheOperations) > 0 || len(node.RedisOperations) > 0 {
+					hasProfilingDataInStack = true
+					break
+				}
+			}
+		}
+		
+		hasProfilingData := hasSqlData || hasHttpData || hasCacheData || hasRedisData || hasProfilingDataInStack
+		
+		// Store full span if: trace should be kept, chunk is done, call stack present, dumps present, any profiling data present, OR always (to capture events even with empty call stack)
+		// Always storing ensures we capture all profiling data regardless of call stack state
+		shouldStoreFull := tb.ShouldKeep(inc.TraceID) || (inc.ChunkDone != nil && *inc.ChunkDone) || hasCallStack || hasDumps || hasProfilingData || true
+		if shouldStoreFull {
 			// Serialize call stack to JSON string
 			stackJSON := "[]"
 			if len(inc.Stack) > 0 {
@@ -4774,11 +4805,22 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 			} else {
 			}
 			
-			// Aggregate HTTP requests from call stack
+			// Aggregate HTTP requests: from direct field (backward compatibility) and from call stack
 			var allHttpRequests []interface{}
+			// Collect from direct HTTP field (backward compatibility)
+			if len(inc.Http) > 0 {
+				var httpArray []interface{}
+				if err := json.Unmarshal(inc.Http, &httpArray); err == nil {
+					allHttpRequests = append(allHttpRequests, httpArray...)
+				}
+			}
+			// Collect from call stack
 			if len(inc.Stack) > 0 {
 				callStack := parseCallStack(inc.Stack)
-				allHttpRequests = collectHttpRequestsFromCallStack(callStack)
+				stackRequests := collectHttpRequestsFromCallStack(callStack)
+				if len(stackRequests) > 0 {
+					allHttpRequests = append(allHttpRequests, stackRequests...)
+				}
 			}
 			httpJSON := "[]"
 			if len(allHttpRequests) > 0 {
@@ -4787,11 +4829,22 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 				}
 			}
 			
-			// Aggregate cache operations from call stack
+			// Aggregate cache operations: from direct field (backward compatibility) and from call stack
 			var allCacheOps []interface{}
+			// Collect from direct Cache field (backward compatibility)
+			if len(inc.Cache) > 0 {
+				var cacheArray []interface{}
+				if err := json.Unmarshal(inc.Cache, &cacheArray); err == nil {
+					allCacheOps = append(allCacheOps, cacheArray...)
+				}
+			}
+			// Collect from call stack
 			if len(inc.Stack) > 0 {
 				callStack := parseCallStack(inc.Stack)
-				allCacheOps = collectCacheOperationsFromCallStack(callStack)
+				stackCacheOps := collectCacheOperationsFromCallStack(callStack)
+				if len(stackCacheOps) > 0 {
+					allCacheOps = append(allCacheOps, stackCacheOps...)
+				}
 			}
 			cacheJSON := "[]"
 			if len(allCacheOps) > 0 {
@@ -4800,11 +4853,22 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 				}
 			}
 			
-			// Aggregate Redis operations from call stack
+			// Aggregate Redis operations: from direct field (backward compatibility) and from call stack
 			var allRedisOps []interface{}
+			// Collect from direct Redis field (backward compatibility)
+			if len(inc.Redis) > 0 {
+				var redisArray []interface{}
+				if err := json.Unmarshal(inc.Redis, &redisArray); err == nil {
+					allRedisOps = append(allRedisOps, redisArray...)
+				}
+			}
+			// Collect from call stack
 			if len(inc.Stack) > 0 {
 				callStack := parseCallStack(inc.Stack)
-				allRedisOps = collectRedisOperationsFromCallStack(callStack)
+				stackRedisOps := collectRedisOperationsFromCallStack(callStack)
+				if len(stackRedisOps) > 0 {
+					allRedisOps = append(allRedisOps, stackRedisOps...)
+				}
 			}
 			redisJSON := "[]"
 			if len(allRedisOps) > 0 {
@@ -4910,6 +4974,9 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 				full["framework_version"] = frameworkVersion
 			}
 			writer.AddFull(full)
+			// Debug: Log that we're storing full span
+			log.Printf("[DEBUG] Storing full span: trace_id=%s, span_id=%s, sql_len=%d, stack_len=%d", 
+				inc.TraceID, inc.SpanID, len(sqlJSON), len(stackJSON))
 		}
 		
 		if inc.TraceID != "" {

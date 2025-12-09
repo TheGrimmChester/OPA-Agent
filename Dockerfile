@@ -19,8 +19,8 @@ COPY *.go ./
 # Download dependencies, this will automatically resolve and download all required packages
 RUN go mod download
 
-# Generate go.sum and verify dependencies
-RUN go mod tidy
+# Generate go.sum and verify dependencies (with retry for network issues)
+RUN go mod tidy || (sleep 5 && go mod tidy) || (sleep 10 && go mod tidy)
 
 # Build the binary
 RUN CGO_ENABLED=0 GOOS=linux go build -o opa-agent .

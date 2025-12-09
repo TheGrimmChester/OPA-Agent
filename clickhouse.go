@@ -68,6 +68,7 @@ func (w *ClickHouseWriter) AddFull(fullRow map[string]interface{}) {
 			url := strings.TrimRight(w.url, "/") + "/?query=INSERT%20INTO%20opa.spans_full%20FORMAT%20JSONEachRow"
 			req, _ := http.NewRequest("POST", url, bytes.NewReader(fullDataCopy))
 			req.Header.Set("Content-Type", "application/json")
+			log.Printf("[DEBUG] Inserting into spans_full: %d bytes", len(fullDataCopy))
 			resp, err := w.client.Do(req)
 			if err != nil {
 				LogError(err, "Failed to flush spans_full to ClickHouse", nil)
@@ -79,6 +80,8 @@ func (w *ClickHouseWriter) AddFull(fullRow map[string]interface{}) {
 						"status_code": resp.StatusCode,
 						"body":        string(bodyBytes),
 					})
+				} else {
+					log.Printf("[DEBUG] Successfully inserted into spans_full: %d bytes", len(fullDataCopy))
 				}
 			}
 		}()
