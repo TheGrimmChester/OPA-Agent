@@ -42,6 +42,17 @@ func (t *TailBuffer) Add(traceID string, raw json.RawMessage) {
 	t.lastSeen[traceID] = time.Now()
 }
 
+// Get retrieves all spans for a trace without removing them
+func (t *TailBuffer) Get(traceID string) []json.RawMessage {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	arr := t.data[traceID]
+	// Return a copy to avoid race conditions
+	result := make([]json.RawMessage, len(arr))
+	copy(result, arr)
+	return result
+}
+
 // GetAndClear retrieves and removes all spans for a trace
 func (t *TailBuffer) GetAndClear(traceID string) []json.RawMessage {
 	t.mu.Lock()

@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -1721,7 +1722,7 @@ func main() {
 
 		rows, err := queryClient.Query(query)
 		var nodes []map[string]interface{}
-		var edges []map[string]interface{}
+		edges := make([]map[string]interface{}, 0) // Initialize as empty slice, not nil
 		services := make(map[string]bool)
 
 		// If metadata table has data, use it
@@ -1846,6 +1847,14 @@ func main() {
 			})
 		}
 
+		// Ensure nodes is always an array, not null
+		if nodes == nil {
+			nodes = []map[string]interface{}{}
+		}
+		if edges == nil {
+			edges = []map[string]interface{}{}
+		}
+		
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"nodes": nodes,
 			"edges": edges,
@@ -3710,6 +3719,7 @@ func main() {
 	writer = NewClickHouseWriter(*clickhouseURL, *batchSize)
 	queryClient = NewClickHouseQuery(*clickhouseURL)
 	breaker = NewCircuitBreaker(10, 30*time.Second)
+	serviceMapProcessors = make(map[string]*ServiceMapProcessor)
 	
 	// Initialize alert worker
 	alertWorker = NewAlertWorker(queryClient, 1*time.Minute)
@@ -3828,6 +3838,25 @@ func main() {
 		t := time.NewTicker(time.Duration(*batchInterval) * time.Millisecond)
 		for range t.C {
 			writer.Flush()
+		}
+	}()
+	
+	// Periodic flush and metadata update for ServiceMapProcessor
+	go func() {
+		t := time.NewTicker(30 * time.Second) // Flush every 30 seconds
+		for range t.C {
+			serviceMapMu.RLock()
+			processors := make([]*ServiceMapProcessor, 0, len(serviceMapProcessors))
+			for _, processor := range serviceMapProcessors {
+				processors = append(processors, processor)
+			}
+			serviceMapMu.RUnlock()
+			
+			for _, processor := range processors {
+				// Update metadata BEFORE flushing (since Flush clears dependencies)
+				processor.UpdateMetadata()
+				processor.Flush()
+			}
 		}
 	}()
 	
@@ -4374,6 +4403,8 @@ var (
 	logCorrelation    *LogCorrelation
 	currentQueueSize  int64
 	currentSamplingRate uint64 = 1000 // 1.0 * 1000
+	serviceMapProcessors map[string]*ServiceMapProcessor // key: "orgID:projectID"
+	serviceMapMu         sync.RWMutex
 )
 
 func handleConn(conn net.Conn, inCh chan<- json.RawMessage) {
@@ -4511,6 +4542,33 @@ func handleErrorMessage(raw json.RawMessage, writer *ClickHouseWriter) {
 	
 	log.Printf("Error tracked: type=%s, message=%.100s, file=%s:%d", 
 		errMsg.ErrorType, errMsg.ErrorMessage, errMsg.File, errMsg.Line)
+}
+
+// getOrCreateServiceMapProcessor gets or creates a ServiceMapProcessor for the given org/project
+func getOrCreateServiceMapProcessor(orgID, projectID string) *ServiceMapProcessor {
+	key := fmt.Sprintf("%s:%s", orgID, projectID)
+	
+	serviceMapMu.RLock()
+	processor, exists := serviceMapProcessors[key]
+	serviceMapMu.RUnlock()
+	
+	if exists {
+		return processor
+	}
+	
+	// Create new processor
+	serviceMapMu.Lock()
+	defer serviceMapMu.Unlock()
+	
+	// Double-check after acquiring write lock
+	if processor, exists := serviceMapProcessors[key]; exists {
+		return processor
+	}
+	
+	processor = NewServiceMapProcessor(queryClient, writer, orgID, projectID)
+	processor.SetURL(*clickhouseURL)
+	serviceMapProcessors[key] = processor
+	return processor
 }
 
 func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWriter, wsHub *WebSocketHub) {
@@ -4679,7 +4737,7 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 			"project_id":      projectID,
 			"trace_id":        inc.TraceID,
 			"span_id":         inc.SpanID,
-			"parent_id":       nil,
+			"parent_id":       inc.ParentID, // Use actual parent_id, not nil
 			"service":         inc.Service,
 			"name":            inc.Name,
 			"url_scheme":      inc.URLScheme,
@@ -4992,6 +5050,63 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 		
 		if inc.TraceID != "" {
 			tb.Add(inc.TraceID, raw)
+		}
+		
+		// Process span for service map
+		if inc.Service != "" {
+			processor := getOrCreateServiceMapProcessor(orgID, projectID)
+			
+			// Create a Span object for processing
+			span := &Span{
+				TraceID:  inc.TraceID,
+				SpanID:   inc.SpanID,
+				ParentID: inc.ParentID,
+				Service:  inc.Service,
+				Name:     inc.Name,
+				StartTS:  inc.StartTS,
+				EndTS:    inc.EndTS,
+				Duration: inc.Duration,
+				CPUms:    inc.CPUms,
+				Status:   inc.Status,
+			}
+			
+			// Parse network data if available
+			if len(inc.Net) > 0 {
+				var net map[string]interface{}
+				if err := json.Unmarshal(inc.Net, &net); err == nil {
+					span.Net = net
+				}
+			}
+			
+			// Try to find parent span from TailBuffer
+			var parentSpan *Span
+			if inc.ParentID != nil && inc.TraceID != "" {
+				// Get all spans for this trace from buffer
+				traceSpans := tb.Get(inc.TraceID)
+				for _, rawSpan := range traceSpans {
+					var parentInc Incoming
+					if err := json.Unmarshal(rawSpan, &parentInc); err == nil {
+						if parentInc.SpanID == *inc.ParentID {
+							parentSpan = &Span{
+								TraceID:  parentInc.TraceID,
+								SpanID:   parentInc.SpanID,
+								ParentID: parentInc.ParentID,
+								Service:  parentInc.Service,
+								Name:     parentInc.Name,
+								StartTS:  parentInc.StartTS,
+								EndTS:    parentInc.EndTS,
+								Duration: parentInc.Duration,
+								CPUms:    parentInc.CPUms,
+								Status:   parentInc.Status,
+							}
+							break
+						}
+					}
+				}
+			}
+			
+			// Process the span with its parent
+			processor.ProcessSpan(span, parentSpan)
 		}
 		
 		breaker.RecordSuccess()
