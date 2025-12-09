@@ -4356,6 +4356,7 @@ func main() {
 					LogError(err, "TCP accept error", nil)
 					continue
 				}
+				log.Printf("[DEBUG] TCP connection accepted from: %s", conn.RemoteAddr())
 				go handleConn(conn, inCh)
 			}
 		}()
@@ -4376,26 +4377,34 @@ var (
 )
 
 func handleConn(conn net.Conn, inCh chan<- json.RawMessage) {
-	defer conn.Close()
-	log.Printf("[DEBUG] New connection from: %s", conn.RemoteAddr())
+	defer func() {
+		log.Printf("[DEBUG] Connection closed: %s", conn.RemoteAddr())
+		conn.Close()
+	}()
+	log.Printf("[DEBUG] Handling connection from: %s", conn.RemoteAddr())
 	scanner := bufio.NewScanner(conn)
 	buf := make([]byte, 0, 64*1024)
 	scanner.Buffer(buf, 10*1024*1024)
 	
+	log.Printf("[DEBUG] Starting to scan for data from: %s", conn.RemoteAddr())
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		log.Printf("[DEBUG] Received line from %s: %d bytes", conn.RemoteAddr(), len(line))
 		incomingCounter.Inc()
 		
 		// Decompress if needed
+		var raw []byte
 		decompressed, err := decompressLZ4(line)
 		if err != nil {
-			LogError(err, "Failed to decompress data", nil)
-			continue
+			log.Printf("[DEBUG] Decompression check failed (may not be compressed): %v, trying as raw JSON", err)
+			// Try as raw JSON if decompression fails (data might not be compressed)
+			raw = make([]byte, len(line))
+			copy(raw, line)
+		} else {
+			log.Printf("[DEBUG] Successfully decompressed: %d bytes -> %d bytes", len(line), len(decompressed))
+			raw = make([]byte, len(decompressed))
+			copy(raw, decompressed)
 		}
-		
-		raw := make([]byte, len(decompressed))
-		copy(raw, decompressed)
 		
 		queueSize := atomic.AddInt64(&currentQueueSize, 1)
 		queueSizeGauge.Set(float64(queueSize))
@@ -4413,7 +4422,9 @@ func handleConn(conn net.Conn, inCh chan<- json.RawMessage) {
 	}
 	
 	if err := scanner.Err(); err != nil {
-		log.Printf("scanner err: %v", err)
+		log.Printf("[DEBUG] Scanner error from %s: %v", conn.RemoteAddr(), err)
+	} else {
+		log.Printf("[DEBUG] Scanner finished normally from %s (no more data)", conn.RemoteAddr())
 	}
 }
 
