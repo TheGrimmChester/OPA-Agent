@@ -2151,17 +2151,15 @@ func main() {
 			var totalErrors uint64
 			var totalLatency float64
 			for _, edge := range edges {
-				if edgeMap, ok := edge.(map[string]interface{}); ok {
-					if to, ok := edgeMap["to"].(string); ok && to == extDep {
-						if count, ok := edgeMap["call_count"].(uint64); ok {
-							totalCalls += count
-						}
-						if latency, ok := edgeMap["avg_latency_ms"].(float64); ok {
-							totalLatency += latency
-						}
-						if errRate, ok := edgeMap["error_rate"].(float64); ok {
-							totalErrors += uint64(float64(totalCalls) * errRate / 100.0)
-						}
+				if to, ok := edge["to"].(string); ok && to == extDep {
+					if count, ok := edge["call_count"].(uint64); ok {
+						totalCalls += count
+					}
+					if latency, ok := edge["avg_latency_ms"].(float64); ok {
+						totalLatency += latency
+					}
+					if errRate, ok := edge["error_rate"].(float64); ok {
+						totalErrors += uint64(float64(totalCalls) * errRate / 100.0)
 					}
 				}
 			}
