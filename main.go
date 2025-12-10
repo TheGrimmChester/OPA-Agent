@@ -160,7 +160,7 @@ func enrichSpansWithFullDetails(spanList []*Span, traceID string, queryClient *C
 	
 	traceIDEscaped := strings.ReplaceAll(traceID, "'", "''")
 	// Query for full details from spans_full
-	query := fmt.Sprintf("SELECT span_id, net, sql, stack, tags, dumps FROM opa.spans_full WHERE trace_id = '%s'", traceIDEscaped)
+	query := fmt.Sprintf("SELECT span_id, net, sql, http, cache, redis, stack, tags, dumps FROM opa.spans_full WHERE trace_id = '%s'", traceIDEscaped)
 	detailRows, err := queryClient.Query(query)
 	if err != nil || len(detailRows) == 0 {
 		// No full details available, that's ok
@@ -1210,6 +1210,27 @@ func main() {
 							var sqlArray []interface{}
 							if err := json.Unmarshal([]byte(sqlStr), &sqlArray); err == nil {
 								span.Sql = sqlArray
+							}
+						}
+						// Enrich with HTTP requests
+						if httpStr := getString(row, "http"); httpStr != "" && httpStr != "[]" {
+							var httpArray []interface{}
+							if err := json.Unmarshal([]byte(httpStr), &httpArray); err == nil {
+								span.Http = httpArray
+							}
+						}
+						// Enrich with cache operations
+						if cacheStr := getString(row, "cache"); cacheStr != "" && cacheStr != "[]" {
+							var cacheArray []interface{}
+							if err := json.Unmarshal([]byte(cacheStr), &cacheArray); err == nil {
+								span.Cache = cacheArray
+							}
+						}
+						// Enrich with Redis operations
+						if redisStr := getString(row, "redis"); redisStr != "" && redisStr != "[]" {
+							var redisArray []interface{}
+							if err := json.Unmarshal([]byte(redisStr), &redisArray); err == nil {
+								span.Redis = redisArray
 							}
 						}
 						// Parse stack correctly: JSON string -> []interface{} -> []*CallNode
