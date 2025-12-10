@@ -58,7 +58,10 @@ jobs:
             SHA=$(echo ${{ github.sha }} | cut -c1-7)
             echo "version=$SHA" >> $GITHUB_OUTPUT
             echo "should_push=true" >> $GITHUB_OUTPUT
-            echo "${{ env.REGISTRY }}/thegrimmchester/${{ env.IMAGE_NAME }}:sha-$SHA" > tags.txt
+            {
+              echo "${{ env.REGISTRY }}/thegrimmchester/${{ env.IMAGE_NAME }}:latest"
+              echo "${{ env.REGISTRY }}/thegrimmchester/${{ env.IMAGE_NAME }}:sha-$SHA"
+            } > tags.txt
           fi
           echo "tags<<EOF" >> $GITHUB_OUTPUT
           cat tags.txt >> $GITHUB_OUTPUT
