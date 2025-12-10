@@ -582,6 +582,9 @@ func main() {
 	if wsPortEnv := os.Getenv("WS_PORT"); wsPortEnv != "" {
 		*wsAddr = ":" + wsPortEnv
 	}
+	if clickhouseEnv := os.Getenv("CLICKHOUSE_URL"); clickhouseEnv != "" {
+		*clickhouseURL = clickhouseEnv
+	}
 	
 	// Start metrics server
 	go func() {
@@ -1728,93 +1731,352 @@ func main() {
 			timeTo = fmt.Sprintf("'%s'", timeTo)
 		}
 
-		// First try to get from service_map_metadata (if populated)
-		query := fmt.Sprintf(`SELECT 
-			from_service,
-			to_service,
-			avg_latency_ms,
-			error_rate,
-			call_count,
-			health_status
-			FROM opa.service_map_metadata
+		// Get health thresholds
+		thresholdsQuery := fmt.Sprintf(`SELECT 
+			degraded_error_rate,
+			down_error_rate,
+			degraded_latency_ms,
+			down_latency_ms
+			FROM opa.service_map_thresholds
 			WHERE organization_id = '%s' AND project_id = '%s'
-			ORDER BY from_service, to_service`,
+			ORDER BY updated_at DESC
+			LIMIT 1`,
 			escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID))
+		
+		thresholdRows, _ := queryClient.Query(thresholdsQuery)
+		degradedErrorRate := 10.0
+		downErrorRate := 50.0
+		degradedLatency := 1000.0
+		downLatency := 5000.0
+		if len(thresholdRows) > 0 {
+			if val, ok := thresholdRows[0]["degraded_error_rate"].(float64); ok {
+				degradedErrorRate = val
+			}
+			if val, ok := thresholdRows[0]["down_error_rate"].(float64); ok {
+				downErrorRate = val
+			}
+			if val, ok := thresholdRows[0]["degraded_latency_ms"].(float64); ok {
+				degradedLatency = val
+			}
+			if val, ok := thresholdRows[0]["down_latency_ms"].(float64); ok {
+				downLatency = val
+			}
+		}
 
-		rows, err := queryClient.Query(query)
+		// Helper function to calculate health status
+		calculateHealthStatus := func(errorRate, avgLatency float64) string {
+			if errorRate >= downErrorRate || avgLatency >= downLatency {
+				return "down"
+			}
+			if errorRate >= degradedErrorRate || avgLatency >= degradedLatency {
+				return "degraded"
+			}
+			return "healthy"
+		}
+
 		var nodes []map[string]interface{}
-		edges := make([]map[string]interface{}, 0) // Initialize as empty slice, not nil
+		edges := make([]map[string]interface{}, 0)
 		services := make(map[string]bool)
 
-		// If metadata table has data, use it
-		if err == nil && len(rows) > 0 {
-			for _, row := range rows {
+		// Get enhanced metrics from service_dependencies table with P95/P99 and throughput
+		enhancedQuery := fmt.Sprintf(`SELECT 
+			from_service,
+			to_service,
+			dependency_type,
+			dependency_target,
+			sum(call_count) as call_count,
+			avg(avg_duration_ms) as avg_latency_ms,
+			quantile(0.95)(avg_duration_ms) as p95_latency_ms,
+			quantile(0.99)(avg_duration_ms) as p99_latency_ms,
+			avg(error_rate) as error_rate,
+			sum(call_count) / (dateDiff('second', min(hour), max(hour)) + 1) as throughput,
+			sum(bytes_sent) as bytes_sent,
+			sum(bytes_received) as bytes_received
+			FROM opa.service_dependencies
+			WHERE organization_id = '%s' AND project_id = '%s'
+				AND hour >= %s AND hour <= %s
+			GROUP BY from_service, to_service, dependency_type, dependency_target
+			ORDER BY from_service, to_service, dependency_type`,
+			escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID), timeFrom, timeTo)
+
+		enhancedRows, enhancedErr := queryClient.Query(enhancedQuery)
+		externalDeps := make(map[string]bool) // Track external dependency nodes
+		if enhancedErr == nil && len(enhancedRows) > 0 {
+			// Use enhanced data from service_dependencies
+			for _, row := range enhancedRows {
 				fromService := getString(row, "from_service")
 				toService := getString(row, "to_service")
+				dependencyType := getString(row, "dependency_type")
+				dependencyTarget := getString(row, "dependency_target")
+				
+				if fromService == "" {
+					continue
+				}
+				
 				services[fromService] = true
-				services[toService] = true
+				
+				// For external dependencies, use dependency_target as the target node
+				if dependencyType != "" && dependencyType != "service" {
+					if dependencyTarget != "" {
+						toService = dependencyTarget
+					}
+					externalDeps[toService] = true
+				} else {
+					services[toService] = true
+				}
 
-				edges = append(edges, map[string]interface{}{
-					"from":          fromService,
-					"to":            toService,
-					"avg_latency_ms": getFloat64(row, "avg_latency_ms"),
-					"error_rate":     getFloat64(row, "error_rate"),
-					"call_count":     getUint64(row, "call_count"),
-					"health_status":  getString(row, "health_status"),
-				})
+				avgLatency := getFloat64(row, "avg_latency_ms")
+				p95Latency := getFloat64(row, "p95_latency_ms")
+				p99Latency := getFloat64(row, "p99_latency_ms")
+				errorRate := getFloat64(row, "error_rate")
+				callCount := getUint64(row, "call_count")
+				throughput := getFloat64(row, "throughput")
+				bytesSent := getUint64(row, "bytes_sent")
+				bytesReceived := getUint64(row, "bytes_received")
+
+				healthStatus := calculateHealthStatus(errorRate, avgLatency)
+
+				edge := map[string]interface{}{
+					"from":            fromService,
+					"to":              toService,
+					"avg_latency_ms":  avgLatency,
+					"p95_latency_ms":  p95Latency,
+					"p99_latency_ms":  p99Latency,
+					"error_rate":      errorRate,
+					"call_count":      callCount,
+					"throughput":      throughput,
+					"bytes_sent":      bytesSent,
+					"bytes_received":  bytesReceived,
+					"health_status":   healthStatus,
+				}
+				
+				// Add dependency type info for external dependencies
+				if dependencyType != "" && dependencyType != "service" {
+					edge["dependency_type"] = dependencyType
+					edge["dependency_target"] = dependencyTarget
+				}
+				
+				edges = append(edges, edge)
 			}
 		} else {
-			// Fallback: derive service dependencies from spans_min by analyzing parent-child relationships
-			// Get all spans with their parent relationships
-			depsQuery := fmt.Sprintf(`SELECT 
-				parent.service as from_service,
-				child.service as to_service,
-				avg(child.duration_ms) as avg_latency_ms,
-				sum(CASE WHEN child.status = 'error' OR child.status = '0' THEN 1 ELSE 0 END) * 100.0 / count(*) as error_rate,
-				count(*) as call_count
-				FROM opa.spans_min as child
-				INNER JOIN opa.spans_min as parent ON child.parent_id = parent.span_id AND child.trace_id = parent.trace_id
-				WHERE child.organization_id = '%s' AND child.project_id = '%s'
-					AND parent.organization_id = '%s' AND parent.project_id = '%s'
-					AND child.service != parent.service
-					AND child.start_ts >= %s AND child.start_ts <= %s
-					AND parent.start_ts >= %s AND parent.start_ts <= %s
-				GROUP BY parent.service, child.service
-				ORDER BY parent.service, child.service`,
-				escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID),
-				escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID),
-				timeFrom, timeTo, timeFrom, timeTo)
+			// Fallback: try service_map_metadata
+			query := fmt.Sprintf(`SELECT 
+				from_service,
+				to_service,
+				avg_latency_ms,
+				p95_latency_ms,
+				p99_latency_ms,
+				error_rate,
+				call_count,
+				throughput,
+				bytes_sent,
+				bytes_received,
+				health_status
+				FROM opa.service_map_metadata
+				WHERE organization_id = '%s' AND project_id = '%s'
+				ORDER BY from_service, to_service`,
+				escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID))
 
-			depsRows, depsErr := queryClient.Query(depsQuery)
-			if depsErr == nil {
-				for _, row := range depsRows {
+			rows, err := queryClient.Query(query)
+			if err == nil && len(rows) > 0 {
+				for _, row := range rows {
 					fromService := getString(row, "from_service")
 					toService := getString(row, "to_service")
-					if fromService == "" || toService == "" {
-						continue
-					}
 					services[fromService] = true
 					services[toService] = true
 
+					edges = append(edges, map[string]interface{}{
+						"from":            fromService,
+						"to":              toService,
+						"avg_latency_ms":  getFloat64(row, "avg_latency_ms"),
+						"p95_latency_ms":  getFloat64(row, "p95_latency_ms"),
+						"p99_latency_ms":  getFloat64(row, "p99_latency_ms"),
+						"error_rate":      getFloat64(row, "error_rate"),
+						"call_count":      getUint64(row, "call_count"),
+						"throughput":      getFloat64(row, "throughput"),
+						"bytes_sent":      getUint64(row, "bytes_sent"),
+						"bytes_received":  getUint64(row, "bytes_received"),
+						"health_status":   getString(row, "health_status"),
+					})
+				}
+			} else {
+				// Final fallback: derive from spans_min
+				depsQuery := fmt.Sprintf(`SELECT 
+					parent.service as from_service,
+					child.service as to_service,
+					avg(child.duration_ms) as avg_latency_ms,
+					quantile(0.95)(child.duration_ms) as p95_latency_ms,
+					quantile(0.99)(child.duration_ms) as p99_latency_ms,
+					sum(CASE WHEN child.status = 'error' OR child.status = '0' THEN 1 ELSE 0 END) * 100.0 / count(*) as error_rate,
+					count(*) as call_count,
+					count(*) / (dateDiff('second', min(child.start_ts), max(child.start_ts)) + 1) as throughput,
+					sum(child.bytes_sent) as bytes_sent,
+					sum(child.bytes_received) as bytes_received
+					FROM opa.spans_min as child
+					INNER JOIN opa.spans_min as parent ON child.parent_id = parent.span_id AND child.trace_id = parent.trace_id
+					WHERE child.organization_id = '%s' AND child.project_id = '%s'
+						AND parent.organization_id = '%s' AND parent.project_id = '%s'
+						AND child.service != parent.service
+						AND child.start_ts >= %s AND child.start_ts <= %s
+						AND parent.start_ts >= %s AND parent.start_ts <= %s
+					GROUP BY parent.service, child.service
+					ORDER BY parent.service, child.service`,
+					escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID),
+					escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID),
+					timeFrom, timeTo, timeFrom, timeTo)
+
+				depsRows, depsErr := queryClient.Query(depsQuery)
+				if depsErr == nil {
+					for _, row := range depsRows {
+						fromService := getString(row, "from_service")
+						toService := getString(row, "to_service")
+						if fromService == "" || toService == "" {
+							continue
+						}
+						services[fromService] = true
+						services[toService] = true
+
+						avgLatency := getFloat64(row, "avg_latency_ms")
+						p95Latency := getFloat64(row, "p95_latency_ms")
+						p99Latency := getFloat64(row, "p99_latency_ms")
+						errorRate := getFloat64(row, "error_rate")
+						callCount := getUint64(row, "call_count")
+						throughput := getFloat64(row, "throughput")
+						bytesSent := getUint64(row, "bytes_sent")
+						bytesReceived := getUint64(row, "bytes_received")
+
+						healthStatus := calculateHealthStatus(errorRate, avgLatency)
+
+						edges = append(edges, map[string]interface{}{
+							"from":            fromService,
+							"to":              toService,
+							"avg_latency_ms":  avgLatency,
+							"p95_latency_ms":  p95Latency,
+							"p99_latency_ms":  p99Latency,
+							"error_rate":      errorRate,
+							"call_count":      callCount,
+							"throughput":      throughput,
+							"bytes_sent":      bytesSent,
+							"bytes_received":  bytesReceived,
+							"health_status":   healthStatus,
+						})
+					}
+				}
+
+				// Extract external dependencies from spans_min
+				// Database dependencies
+				dbQuery := fmt.Sprintf(`SELECT 
+					service as from_service,
+					db_system,
+					avg(duration_ms) as avg_latency_ms,
+					quantile(0.95)(duration_ms) as p95_latency_ms,
+					quantile(0.99)(duration_ms) as p99_latency_ms,
+					sum(CASE WHEN status = 'error' OR status = '0' THEN 1 ELSE 0 END) * 100.0 / count(*) as error_rate,
+					count(*) as call_count,
+					count(*) / (dateDiff('second', min(start_ts), max(start_ts)) + 1) as throughput,
+					sum(bytes_sent) as bytes_sent,
+					sum(bytes_received) as bytes_received
+					FROM opa.spans_min
+					WHERE organization_id = '%s' AND project_id = '%s'
+						AND db_system IS NOT NULL AND db_system != ''
+						AND start_ts >= %s AND start_ts <= %s
+					GROUP BY service, db_system
+					ORDER BY service, db_system`,
+					escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID), timeFrom, timeTo)
+
+				dbRows, _ := queryClient.Query(dbQuery)
+				for _, row := range dbRows {
+					fromService := getString(row, "from_service")
+					dbSystem := getString(row, "db_system")
+					if fromService == "" || dbSystem == "" {
+						continue
+					}
+					services[fromService] = true
+					target := fmt.Sprintf("db:%s", dbSystem)
+					externalDeps[target] = true
+
 					avgLatency := getFloat64(row, "avg_latency_ms")
+					p95Latency := getFloat64(row, "p95_latency_ms")
+					p99Latency := getFloat64(row, "p99_latency_ms")
 					errorRate := getFloat64(row, "error_rate")
 					callCount := getUint64(row, "call_count")
-
-					healthStatus := "healthy"
-					if errorRate > 10.0 || avgLatency > 1000.0 {
-						healthStatus = "degraded"
-					}
-					if errorRate > 50.0 {
-						healthStatus = "down"
-					}
+					throughput := getFloat64(row, "throughput")
+					bytesSent := getUint64(row, "bytes_sent")
+					bytesReceived := getUint64(row, "bytes_received")
+					healthStatus := calculateHealthStatus(errorRate, avgLatency)
 
 					edges = append(edges, map[string]interface{}{
-						"from":          fromService,
-						"to":            toService,
-						"avg_latency_ms": avgLatency,
-						"error_rate":     errorRate,
-						"call_count":     callCount,
-						"health_status":  healthStatus,
+						"from":            fromService,
+						"to":              target,
+						"avg_latency_ms":  avgLatency,
+						"p95_latency_ms":  p95Latency,
+						"p99_latency_ms":  p99Latency,
+						"error_rate":      errorRate,
+						"call_count":      callCount,
+						"throughput":      throughput,
+						"bytes_sent":      bytesSent,
+						"bytes_received":  bytesReceived,
+						"health_status":   healthStatus,
+						"dependency_type": "database",
+						"dependency_target": target,
+					})
+				}
+
+				// HTTP/cURL dependencies
+				httpQuery := fmt.Sprintf(`SELECT 
+					service as from_service,
+					concat(coalesce(url_scheme, 'http'), '://', url_host) as target_url,
+					avg(duration_ms) as avg_latency_ms,
+					quantile(0.95)(duration_ms) as p95_latency_ms,
+					quantile(0.99)(duration_ms) as p99_latency_ms,
+					sum(CASE WHEN status = 'error' OR status = '0' THEN 1 ELSE 0 END) * 100.0 / count(*) as error_rate,
+					count(*) as call_count,
+					count(*) / (dateDiff('second', min(start_ts), max(start_ts)) + 1) as throughput,
+					sum(bytes_sent) as bytes_sent,
+					sum(bytes_received) as bytes_received
+					FROM opa.spans_min
+					WHERE organization_id = '%s' AND project_id = '%s'
+						AND url_host IS NOT NULL AND url_host != ''
+						AND url_host != service
+						AND start_ts >= %s AND start_ts <= %s
+					GROUP BY service, url_scheme, url_host
+					ORDER BY service, url_scheme, url_host`,
+					escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID), timeFrom, timeTo)
+
+				httpRows, _ := queryClient.Query(httpQuery)
+				for _, row := range httpRows {
+					fromService := getString(row, "from_service")
+					target := getString(row, "target_url")
+					if fromService == "" || target == "" {
+						continue
+					}
+					services[fromService] = true
+					externalDeps[target] = true
+
+					avgLatency := getFloat64(row, "avg_latency_ms")
+					p95Latency := getFloat64(row, "p95_latency_ms")
+					p99Latency := getFloat64(row, "p99_latency_ms")
+					errorRate := getFloat64(row, "error_rate")
+					callCount := getUint64(row, "call_count")
+					throughput := getFloat64(row, "throughput")
+					bytesSent := getUint64(row, "bytes_sent")
+					bytesReceived := getUint64(row, "bytes_received")
+					healthStatus := calculateHealthStatus(errorRate, avgLatency)
+
+					edges = append(edges, map[string]interface{}{
+						"from":            fromService,
+						"to":              target,
+						"avg_latency_ms":  avgLatency,
+						"p95_latency_ms":  p95Latency,
+						"p99_latency_ms":  p99Latency,
+						"error_rate":      errorRate,
+						"call_count":      callCount,
+						"throughput":      throughput,
+						"bytes_sent":      bytesSent,
+						"bytes_received":  bytesReceived,
+						"health_status":   healthStatus,
+						"dependency_type": "http",
+						"dependency_target": target,
 					})
 				}
 			}
@@ -1850,21 +2112,75 @@ func main() {
 			
 			statsRows, _ := queryClient.Query(statsQuery)
 			healthStatus := "healthy"
+			var avgDuration, errorRate float64
+			var totalSpans uint64
 			if len(statsRows) > 0 {
-				errorRate := getFloat64(statsRows[0], "error_rate")
-				avgDuration := getFloat64(statsRows[0], "avg_duration")
-				if errorRate > 10.0 || avgDuration > 1000.0 {
-					healthStatus = "degraded"
-				}
-				if errorRate > 50.0 {
-					healthStatus = "down"
-				}
+				errorRate = getFloat64(statsRows[0], "error_rate")
+				avgDuration = getFloat64(statsRows[0], "avg_duration")
+				totalSpans = getUint64(statsRows[0], "total_spans")
+				healthStatus = calculateHealthStatus(errorRate, avgDuration)
 			}
 
 			nodes = append(nodes, map[string]interface{}{
 				"id":            service,
 				"service":       service,
 				"health_status": healthStatus,
+				"avg_duration":  avgDuration,
+				"error_rate":    errorRate,
+				"total_spans":   totalSpans,
+				"node_type":     "service",
+			})
+		}
+
+		// Create nodes for external dependencies
+		for extDep := range externalDeps {
+			// Determine dependency type from the target name
+			depType := "external"
+			if strings.HasPrefix(extDep, "db:") {
+				depType = "database"
+			} else if strings.HasPrefix(extDep, "http://") || strings.HasPrefix(extDep, "https://") {
+				depType = "http"
+			} else if strings.HasPrefix(extDep, "redis://") || extDep == "redis" {
+				depType = "redis"
+			} else if strings.HasPrefix(extDep, "cache:") || strings.HasPrefix(extDep, "cache://") {
+				depType = "cache"
+			}
+
+			// Calculate health status from edges
+			var totalCalls uint64
+			var totalErrors uint64
+			var totalLatency float64
+			for _, edge := range edges {
+				if edgeMap, ok := edge.(map[string]interface{}); ok {
+					if to, ok := edgeMap["to"].(string); ok && to == extDep {
+						if count, ok := edgeMap["call_count"].(uint64); ok {
+							totalCalls += count
+						}
+						if latency, ok := edgeMap["avg_latency_ms"].(float64); ok {
+							totalLatency += latency
+						}
+						if errRate, ok := edgeMap["error_rate"].(float64); ok {
+							totalErrors += uint64(float64(totalCalls) * errRate / 100.0)
+						}
+					}
+				}
+			}
+
+			errorRate := 0.0
+			avgLatency := 0.0
+			if totalCalls > 0 {
+				errorRate = float64(totalErrors) / float64(totalCalls) * 100.0
+				avgLatency = totalLatency / float64(totalCalls)
+			}
+			healthStatus := calculateHealthStatus(errorRate, avgLatency)
+
+			nodes = append(nodes, map[string]interface{}{
+				"id":            extDep,
+				"service":       extDep,
+				"health_status": healthStatus,
+				"node_type":     depType,
+				"avg_duration":  avgLatency,
+				"error_rate":    errorRate,
 			})
 		}
 
@@ -1880,6 +2196,103 @@ func main() {
 			"nodes": nodes,
 			"edges": edges,
 		})
+	})
+
+	// Service Map Health Thresholds endpoint
+	mux.HandleFunc("/api/service-map/thresholds", func(w http.ResponseWriter, r *http.Request) {
+		ctx, _ := ExtractTenantContext(r, queryClient)
+		
+		switch r.Method {
+		case "GET":
+			query := fmt.Sprintf(`SELECT 
+				degraded_error_rate,
+				down_error_rate,
+				degraded_latency_ms,
+				down_latency_ms,
+				updated_at
+				FROM opa.service_map_thresholds
+				WHERE organization_id = '%s' AND project_id = '%s'
+				ORDER BY updated_at DESC
+				LIMIT 1`,
+				escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID))
+			
+			rows, err := queryClient.Query(query)
+			if err != nil {
+				LogError(err, "Failed to fetch health thresholds", map[string]interface{}{
+					"org_id": ctx.OrganizationID,
+					"project_id": ctx.ProjectID,
+				})
+				http.Error(w, fmt.Sprintf("query error: %v", err), 500)
+				return
+			}
+			
+			if len(rows) > 0 {
+				json.NewEncoder(w).Encode(rows[0])
+			} else {
+				// Return defaults if not found
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"degraded_error_rate": 10.0,
+					"down_error_rate": 50.0,
+					"degraded_latency_ms": 1000.0,
+					"down_latency_ms": 5000.0,
+				})
+			}
+			
+		case "POST", "PUT":
+			var thresholds map[string]interface{}
+			if err := json.NewDecoder(r.Body).Decode(&thresholds); err != nil {
+				http.Error(w, fmt.Sprintf("invalid JSON: %v", err), 400)
+				return
+			}
+			
+			degradedErrorRate := 10.0
+			downErrorRate := 50.0
+			degradedLatency := 1000.0
+			downLatency := 5000.0
+			
+			if val, ok := thresholds["degraded_error_rate"].(float64); ok {
+				degradedErrorRate = val
+			}
+			if val, ok := thresholds["down_error_rate"].(float64); ok {
+				downErrorRate = val
+			}
+			if val, ok := thresholds["degraded_latency_ms"].(float64); ok {
+				degradedLatency = val
+			}
+			if val, ok := thresholds["down_latency_ms"].(float64); ok {
+				downLatency = val
+			}
+			
+			query := fmt.Sprintf(`INSERT INTO opa.service_map_thresholds 
+				(organization_id, project_id, degraded_error_rate, down_error_rate, degraded_latency_ms, down_latency_ms, updated_at)
+				VALUES ('%s', '%s', %.2f, %.2f, %.2f, %.2f, now())`,
+				escapeSQL(ctx.OrganizationID),
+				escapeSQL(ctx.ProjectID),
+				degradedErrorRate,
+				downErrorRate,
+				degradedLatency,
+				downLatency)
+			
+			if err := queryClient.Execute(query); err != nil {
+				LogError(err, "Failed to update health thresholds", map[string]interface{}{
+					"org_id": ctx.OrganizationID,
+					"project_id": ctx.ProjectID,
+				})
+				http.Error(w, fmt.Sprintf("query error: %v", err), 500)
+				return
+			}
+			
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": true,
+				"degraded_error_rate": degradedErrorRate,
+				"down_error_rate": downErrorRate,
+				"degraded_latency_ms": degradedLatency,
+				"down_latency_ms": downLatency,
+			})
+			
+		default:
+			http.Error(w, "method not allowed", 405)
+		}
 	})
 	
 	// Key Transactions endpoints
