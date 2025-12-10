@@ -163,6 +163,46 @@ func (w *ClickHouseWriter) AddError(errorInstance, errorGroup map[string]interfa
 	}()
 }
 
+// AddLog adds a log entry to ClickHouse
+func (w *ClickHouseWriter) AddLog(logEntry map[string]interface{}) {
+	// Convert timestamp to DateTime64(3) format if it's a string
+	if timestampStr, ok := logEntry["timestamp"].(string); ok {
+		// Parse the timestamp string and reformat for ClickHouse DateTime64(3)
+		if t, err := time.Parse("2006-01-02 15:04:05.000", timestampStr); err == nil {
+			logEntry["timestamp"] = t.Format("2006-01-02 15:04:05.000")
+		} else if t, err := time.Parse("2006-01-02 15:04:05", timestampStr); err == nil {
+			logEntry["timestamp"] = t.Format("2006-01-02 15:04:05.000")
+		} else {
+			// If parsing fails, use current time
+			logEntry["timestamp"] = time.Now().Format("2006-01-02 15:04:05.000")
+		}
+	} else {
+		// If timestamp is missing, use current time
+		logEntry["timestamp"] = time.Now().Format("2006-01-02 15:04:05.000")
+	}
+	
+	// Ensure span_id is properly handled (can be empty string for NULL)
+	if spanID, ok := logEntry["span_id"].(string); ok && spanID == "" {
+		logEntry["span_id"] = nil
+	}
+	
+	logJSON, _ := json.Marshal(logEntry)
+	logData := append(logJSON, '\n')
+	
+	// Write asynchronously
+	go func() {
+		url := strings.TrimRight(w.url, "/") + "/?query=INSERT%20INTO%20opa.logs%20FORMAT%20JSONEachRow"
+		req, _ := http.NewRequest("POST", url, bytes.NewReader(logData))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := w.client.Do(req)
+		if err != nil {
+			LogError(err, "Failed to write log to ClickHouse", nil)
+		} else {
+			resp.Body.Close()
+		}
+	}()
+}
+
 // Flush flushes all buffered data to ClickHouse
 func (w *ClickHouseWriter) Flush() {
 	w.bufMu.Lock()

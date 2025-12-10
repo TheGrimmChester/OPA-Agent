@@ -2971,6 +2971,152 @@ func main() {
 		})
 	})
 	
+	// GET /api/logs - Get recent logs from all traces
+	mux.HandleFunc("/api/logs", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		
+		limit := r.URL.Query().Get("limit")
+		if limit == "" {
+			limit = "100" // Smaller batch size for infinite scroll
+		}
+		limitInt, _ := strconv.Atoi(limit)
+		if limitInt > 500 {
+			limitInt = 500 // Cap at 500 per request
+		}
+		
+		since := r.URL.Query().Get("since")
+		service := r.URL.Query().Get("service")
+		level := r.URL.Query().Get("level")
+		all := r.URL.Query().Get("all") // If "all" is set, fetch all historical logs
+		cursor := r.URL.Query().Get("cursor") // Timestamp cursor for pagination
+		
+		// Query opa.logs table
+		query := `SELECT 
+			id,
+			trace_id,
+			span_id,
+			service,
+			level,
+			message,
+			toUnixTimestamp64Milli(timestamp) as timestamp_ms,
+			timestamp,
+			fields
+		FROM opa.logs 
+		WHERE 1=1`
+		
+		if service != "" {
+			query += fmt.Sprintf(" AND service = '%s'", strings.ReplaceAll(service, "'", "''"))
+		}
+		
+		if level != "" {
+			query += fmt.Sprintf(" AND level = '%s'", strings.ReplaceAll(level, "'", "''"))
+		}
+		
+		// Cursor-based pagination: if cursor is provided, fetch logs older than cursor
+		if cursor != "" {
+			// Parse cursor as timestamp (milliseconds since epoch)
+			if cursorInt, err := strconv.ParseInt(cursor, 10, 64); err == nil {
+				// Convert to ClickHouse datetime format
+				cursorTime := time.UnixMilli(cursorInt).Format("2006-01-02 15:04:05.000")
+				query += fmt.Sprintf(" AND timestamp < '%s'", cursorTime)
+			}
+		} else {
+			// Only apply time restriction if "all" is not set and "since" is not provided
+			if all == "" {
+				if since != "" {
+					query += fmt.Sprintf(" AND timestamp >= '%s'", since)
+				} else {
+					// Default to last 7 days for better coverage while still being reasonable
+					query += " AND timestamp >= now() - INTERVAL 7 DAY"
+				}
+			} else if since != "" {
+				// If "all" is set but "since" is also provided, use "since" as minimum
+				query += fmt.Sprintf(" AND timestamp >= '%s'", since)
+			}
+			// If "all" is set and no "since", no time restriction (fetch all historical)
+		}
+		
+		query += " ORDER BY timestamp DESC LIMIT " + strconv.Itoa(limitInt)
+		
+		rows, err := queryClient.Query(query)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("query error: %v", err), 500)
+			return
+		}
+		
+		var allLogs []map[string]interface{}
+		
+		for _, row := range rows {
+			logID := getString(row, "id")
+			traceID := getString(row, "trace_id")
+			spanID := getString(row, "span_id")
+			serviceName := getString(row, "service")
+			levelName := getString(row, "level")
+			message := getString(row, "message")
+			fieldsStr := getString(row, "fields")
+			
+			// Get timestamp in milliseconds (preferred method)
+			var timestampMs int64
+			if tsMs, ok := row["timestamp_ms"].(float64); ok {
+				timestampMs = int64(tsMs)
+			} else if tsMs, ok := row["timestamp_ms"].(int64); ok {
+				timestampMs = tsMs
+			} else {
+				// Fallback: parse timestamp string
+				timestampStr := getString(row, "timestamp")
+				if timestampStr != "" {
+					timestamp, err := time.Parse("2006-01-02 15:04:05.000", timestampStr)
+					if err != nil {
+						// Try alternative formats
+						timestamp, err = time.Parse("2006-01-02 15:04:05", timestampStr)
+						if err != nil {
+							timestamp, _ = time.Parse(time.RFC3339, timestampStr)
+						}
+					}
+					timestampMs = timestamp.UnixMilli()
+				}
+			}
+			
+			// Parse fields JSON
+			var fields map[string]interface{}
+			if fieldsStr != "" && fieldsStr != "null" {
+				json.Unmarshal([]byte(fieldsStr), &fields)
+			}
+			
+			allLogs = append(allLogs, map[string]interface{}{
+				"id":        logID,
+				"trace_id":  traceID,
+				"span_id":   spanID,
+				"service":   serviceName,
+				"level":     levelName,
+				"message":   message,
+				"timestamp": timestampMs,
+				"fields":    fields,
+			})
+		}
+		
+		// Calculate next cursor (timestamp of the last log, or 0 if no more)
+		nextCursor := int64(0)
+		hasMore := false
+		if len(allLogs) > 0 {
+			lastLog := allLogs[len(allLogs)-1]
+			if ts, ok := lastLog["timestamp"].(int64); ok && ts > 0 {
+				nextCursor = ts
+				hasMore = len(allLogs) == limitInt // If we got full batch, there might be more
+			}
+		}
+		
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"logs":       allLogs,
+			"total":      len(allLogs),
+			"has_more":   hasMore,
+			"next_cursor": nextCursor,
+		})
+	})
+	
 	// SLO endpoints
 	mux.HandleFunc("/api/slos", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -4482,21 +4628,34 @@ func handleConn(conn net.Conn, inCh chan<- json.RawMessage) {
 
 // Error message structure
 type ErrorMessage struct {
-	Type            string  `json:"type"`
-	TraceID         string  `json:"trace_id"`
-	SpanID          string  `json:"span_id"`
-	InstanceID      string  `json:"instance_id"`
-	GroupID         string  `json:"group_id"`
-	Fingerprint     string  `json:"fingerprint"`
-	ErrorType       string  `json:"error_type"`
-	ErrorMessage    string  `json:"error_message"`
-	File            string  `json:"file"`
-	Line            int     `json:"line"`
-	StackTrace      string  `json:"stack_trace,omitempty"`
-	OrganizationID  string  `json:"organization_id"`
-	ProjectID       string  `json:"project_id"`
-	Service         string  `json:"service"`
-	OccurredAtMs    int64   `json:"occurred_at_ms"`
+	Type            string          `json:"type"`
+	TraceID         string          `json:"trace_id"`
+	SpanID          string          `json:"span_id"`
+	InstanceID      string          `json:"instance_id"`
+	GroupID         string          `json:"group_id"`
+	Fingerprint     string          `json:"fingerprint"`
+	ErrorType       string          `json:"error_type"`
+	ErrorMessage    string          `json:"error_message"`
+	File            string          `json:"file"`
+	Line            int             `json:"line"`
+	StackTrace      json.RawMessage `json:"stack_trace,omitempty"` // Can be array or string
+	OrganizationID  string          `json:"organization_id"`
+	ProjectID       string          `json:"project_id"`
+	Service         string          `json:"service"`
+	OccurredAtMs    int64           `json:"occurred_at_ms"`
+}
+
+// Log message structure
+type LogMessage struct {
+	Type        string                 `json:"type"`
+	ID          string                 `json:"id"`
+	TraceID     string                 `json:"trace_id"`
+	SpanID      *string                `json:"span_id"`
+	Level       string                 `json:"level"`
+	Message     string                 `json:"message"`
+	Service     string                 `json:"service"`
+	TimestampMs int64                  `json:"timestamp_ms"`
+	Fields      map[string]interface{} `json:"fields"`
 }
 
 // Handle error messages from PHP extension
@@ -4524,6 +4683,20 @@ func handleErrorMessage(raw json.RawMessage, writer *ClickHouseWriter) {
 		occurredAt = time.Now()
 	}
 	
+	// Convert stack_trace to string if it's JSON
+	stackTraceStr := ""
+	if len(errMsg.StackTrace) > 0 {
+		// If it's already a string (wrapped in quotes), use it directly
+		// Otherwise, it's a JSON array/object, marshal it to string
+		if errMsg.StackTrace[0] == '"' {
+			// It's a JSON string, unmarshal it
+			json.Unmarshal(errMsg.StackTrace, &stackTraceStr)
+		} else {
+			// It's a JSON array/object, convert to string
+			stackTraceStr = string(errMsg.StackTrace)
+		}
+	}
+	
 	// Write error instance
 	errorInstance := map[string]interface{}{
 		"organization_id": errMsg.OrganizationID,
@@ -4534,7 +4707,7 @@ func handleErrorMessage(raw json.RawMessage, writer *ClickHouseWriter) {
 		"span_id":         errMsg.SpanID,
 		"error_type":      errMsg.ErrorType,
 		"error_message":  errMsg.ErrorMessage,
-		"stack_trace":     errMsg.StackTrace,
+		"stack_trace":     stackTraceStr,
 		"occurred_at":     occurredAt.Format("2006-01-02 15:04:05"),
 		"environment":     "production",
 		"release":         "",
@@ -4563,6 +4736,80 @@ func handleErrorMessage(raw json.RawMessage, writer *ClickHouseWriter) {
 	
 	log.Printf("Error tracked: type=%s, message=%.100s, file=%s:%d", 
 		errMsg.ErrorType, errMsg.ErrorMessage, errMsg.File, errMsg.Line)
+}
+
+// Handle log messages from PHP extension
+func handleLogMessage(raw json.RawMessage, writer *ClickHouseWriter, wsHub *WebSocketHub) {
+	var logMsg LogMessage
+	if err := json.Unmarshal(raw, &logMsg); err != nil {
+		log.Printf("Failed to unmarshal log message: %v", err)
+		return
+	}
+	
+	// Set defaults
+	if logMsg.Service == "" {
+		logMsg.Service = "php-fpm"
+	}
+	if logMsg.ID == "" {
+		logMsg.ID = fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	
+	// Convert timestamp from milliseconds
+	var timestamp time.Time
+	if logMsg.TimestampMs > 0 {
+		timestamp = time.UnixMilli(logMsg.TimestampMs)
+	} else {
+		timestamp = time.Now()
+	}
+	
+	// Serialize fields to JSON string
+	fieldsJSON := "{}"
+	var fieldsMap map[string]interface{}
+	if logMsg.Fields != nil && len(logMsg.Fields) > 0 {
+		if fieldsBytes, err := json.Marshal(logMsg.Fields); err == nil {
+			fieldsJSON = string(fieldsBytes)
+			json.Unmarshal(fieldsBytes, &fieldsMap)
+		}
+	}
+	
+	// Prepare span_id (nullable - use nil for empty string)
+	var spanID interface{} = nil
+	spanIDStr := ""
+	if logMsg.SpanID != nil && *logMsg.SpanID != "" {
+		spanID = *logMsg.SpanID
+		spanIDStr = *logMsg.SpanID
+	}
+	
+	// Write log to ClickHouse
+	logEntry := map[string]interface{}{
+		"id":        logMsg.ID,
+		"trace_id":  logMsg.TraceID,
+		"span_id":   spanID,
+		"service":   logMsg.Service,
+		"level":     logMsg.Level,
+		"message":   logMsg.Message,
+		"timestamp": timestamp.Format("2006-01-02 15:04:05.000"),
+		"fields":    fieldsJSON,
+	}
+	
+	writer.AddLog(logEntry)
+	
+	// Broadcast log via WebSocket
+	if wsHub != nil {
+		broadcastData := map[string]interface{}{
+			"trace_id":  logMsg.TraceID,
+			"span_id":   spanIDStr,
+			"service":   logMsg.Service,
+			"level":     logMsg.Level,
+			"message":   logMsg.Message,
+			"timestamp": timestamp.Unix(),
+			"fields":    fieldsMap,
+		}
+		wsHub.Broadcast("logs", broadcastData)
+	}
+	
+	log.Printf("Log tracked: level=%s, message=%.100s, trace_id=%s", 
+		logMsg.Level, logMsg.Message, logMsg.TraceID)
 }
 
 // getOrCreateServiceMapProcessor gets or creates a ServiceMapProcessor for the given org/project
@@ -4609,7 +4856,11 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 			Type string `json:"type"`
 		}
 		if err := json.Unmarshal(raw, &msgType); err != nil {
-			log.Printf("bad json: %v", err)
+			previewLen := 200
+			if len(raw) < previewLen {
+				previewLen = len(raw)
+			}
+			log.Printf("bad json: %v, first %d chars: %s", err, previewLen, string(raw[:previewLen]))
 			breaker.RecordFailure()
 			continue
 		}
@@ -4617,6 +4868,13 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 		// Handle error messages separately
 		if msgType.Type == "error" {
 			handleErrorMessage(raw, writer)
+			processingDuration.Observe(time.Since(start).Seconds())
+			continue
+		}
+		
+		// Handle log messages separately
+		if msgType.Type == "log" {
+			handleLogMessage(raw, writer, wsHub)
 			processingDuration.Observe(time.Since(start).Seconds())
 			continue
 		}
