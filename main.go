@@ -820,15 +820,22 @@ func reconstructTrace(spans []*Span) *Trace {
 		}
 	}
 	
-	// Expand call stack nodes into child spans for the root span (if expand_spans flag is true)
-	// This converts significant call stack nodes (SQL, HTTP, cache, Redis, or long calls) into separate child spans
-	// for better trace visualization. If expand_spans is false, the original single-span behavior is preserved.
-	// NOTE: Expansion only works when the call stack is present. If the call stack is empty, there's nothing to expand.
-	if root != nil && len(root.Stack) > 0 {
+	// Check if child spans were already sent separately
+	// If multiple spans exist and root has empty stack, spans were sent separately (no expansion needed)
+	// If only root span exists with stack, expand for backward compatibility with old traces
+	hasChildSpans := len(spans) > 1
+	hasStackInRoot := root != nil && len(root.Stack) > 0
+	
+	// Only expand if:
+	// 1. Root has a call stack (old format)
+	// 2. Only one span exists (no child spans sent separately)
+	// 3. expand_spans flag is true (or not set, default true)
+	if root != nil && hasStackInRoot && !hasChildSpans {
 		// Check expand_spans flag from root span's tags (defaults to true for backward compatibility)
 		shouldExpand := extractExpandSpansFlag(root)
 		
 		if shouldExpand {
+			// Backward compatibility: expand old traces that have embedded stack
 			expandedSpans := expandCallStackToSpans(root)
 			// Update the spans list with expanded spans
 			spans = expandedSpans
@@ -853,6 +860,7 @@ func reconstructTrace(spans []*Span) *Trace {
 		}
 		// If shouldExpand is false, keep original behavior: single span with call stack nested inside
 	}
+	// If hasChildSpans is true, child spans were already sent separately, no expansion needed
 	
 	return &Trace{
 		TraceID: spans[0].TraceID,
@@ -946,31 +954,78 @@ func main() {
 		ctx, _ := ExtractTenantContext(r, queryClient)
 		switch r.Method {
 		case "GET":
-			query := "SELECT org_id, name, settings, created_at, updated_at FROM opa.organizations"
-			// If user has organization context, filter by it
-			if ctx.OrganizationID != "default-org" {
-				query += fmt.Sprintf(" WHERE org_id = '%s'", escapeSQL(ctx.OrganizationID))
-			}
-			query += " ORDER BY created_at DESC"
+			// Get distinct organizations from actual data (spans_min) instead of organizations table
+			// This ensures we show organizations that actually have data
+			query := `SELECT DISTINCT 
+				coalesce(nullif(organization_id, ''), 'default-org') as org_id,
+				coalesce(nullif(organization_id, ''), 'default-org') as name
+			FROM opa.spans_min 
+			WHERE start_ts >= now() - INTERVAL 30 DAY
+			ORDER BY org_id`
+			
 			rows, err := queryClient.Query(query)
 			if err != nil {
-				LogError(err, "ClickHouse query error", map[string]interface{}{
-					"path": r.URL.Path,
+				LogError(err, "ClickHouse query error (spans_min)", map[string]interface{}{
+					"path":  r.URL.Path,
 					"method": r.Method,
+					"query":  query,
 				})
-				http.Error(w, fmt.Sprintf("query error: %v", err), 500)
-				return
+				// Fallback to organizations table if spans query fails
+				query = "SELECT org_id, name, settings, created_at, updated_at FROM opa.organizations"
+				if ctx.OrganizationID != "default-org" {
+					query += fmt.Sprintf(" WHERE org_id = '%s'", escapeSQL(ctx.OrganizationID))
+				}
+				query += " ORDER BY created_at DESC"
+				rows, err = queryClient.Query(query)
+				if err != nil {
+					LogError(err, "ClickHouse query error (organizations table)", map[string]interface{}{
+						"path": r.URL.Path,
+						"method": r.Method,
+					})
+					http.Error(w, fmt.Sprintf("query error: %v", err), 500)
+					return
+				}
 			}
-			var orgs []map[string]interface{}
-			for _, row := range rows {
-				orgs = append(orgs, map[string]interface{}{
-					"org_id":     getString(row, "org_id"),
-					"name":       getString(row, "name"),
-					"settings":   getString(row, "settings"),
-					"created_at": getString(row, "created_at"),
-					"updated_at": getString(row, "updated_at"),
-				})
+			
+			orgs := make([]map[string]interface{}, 0)
+			log.Printf("[DEBUG] Organizations query: row_count=%d, query=%s", len(rows), query)
+			for i, row := range rows {
+				orgID := getString(row, "org_id")
+				orgName := getString(row, "name")
+				log.Printf("[DEBUG] Row %d: org_id=%s, name=%s, row=%v", i, orgID, orgName, row)
+				// If name is empty or same as org_id, use a formatted name
+				if orgName == "" || orgName == orgID {
+					orgName = orgID
+					// Format: "default-org" -> "Default Org"
+					if orgID == "default-org" {
+						orgName = "Default Organization"
+					} else {
+						// Capitalize first letter and add spaces before capital letters
+						orgName = strings.Title(strings.ReplaceAll(orgID, "-", " "))
+					}
+				}
+				orgMap := map[string]interface{}{
+					"org_id": orgID,
+					"name":   orgName,
+				}
+				// Only add these if they exist (from organizations table fallback)
+				if settings := getString(row, "settings"); settings != "" {
+					orgMap["settings"] = settings
+				}
+				if createdAt := getString(row, "created_at"); createdAt != "" {
+					orgMap["created_at"] = createdAt
+				}
+				if updatedAt := getString(row, "updated_at"); updatedAt != "" {
+					orgMap["updated_at"] = updatedAt
+				}
+				orgs = append(orgs, orgMap)
 			}
+			// Always return an array, never null
+			if orgs == nil {
+				orgs = []map[string]interface{}{}
+			}
+			log.Printf("[DEBUG] Returning organizations: count=%d", len(orgs))
+			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{"organizations": orgs})
 		case "POST":
 			var org struct {
@@ -1018,27 +1073,87 @@ func main() {
 			if orgID == "" {
 				orgID = ctx.OrganizationID
 			}
-			query := fmt.Sprintf("SELECT project_id, org_id, name, dsn, created_at, updated_at FROM opa.projects WHERE org_id = '%s' ORDER BY created_at DESC",
+			// Normalize orgID (handle "all" and empty)
+			if orgID == "all" || orgID == "" {
+				orgID = "default-org"
+			}
+			
+			// Get distinct projects from actual data (spans_min) instead of projects table
+			// This ensures we show projects that actually have data for the given organization
+			query := fmt.Sprintf(`SELECT DISTINCT 
+				coalesce(nullif(project_id, ''), 'default-project') as project_id,
+				coalesce(nullif(project_id, ''), 'default-project') as name,
+				coalesce(nullif(organization_id, ''), 'default-org') as org_id
+			FROM opa.spans_min 
+			WHERE (coalesce(nullif(organization_id, ''), 'default-org') = '%s')
+				AND start_ts >= now() - INTERVAL 30 DAY
+			ORDER BY project_id`,
 				escapeSQL(orgID))
+			
 			rows, err := queryClient.Query(query)
 			if err != nil {
-				LogError(err, "ClickHouse query error", map[string]interface{}{
-					"path": r.URL.Path,
+				LogError(err, "ClickHouse query error (spans_min for projects)", map[string]interface{}{
+					"path":  r.URL.Path,
 					"method": r.Method,
+					"query":  query,
 				})
-				http.Error(w, fmt.Sprintf("query error: %v", err), 500)
-				return
+				// Fallback to projects table if spans query fails
+				query = fmt.Sprintf("SELECT project_id, org_id, name, dsn, created_at, updated_at FROM opa.projects WHERE org_id = '%s' ORDER BY created_at DESC",
+					escapeSQL(orgID))
+				rows, err = queryClient.Query(query)
+				if err != nil {
+					LogError(err, "ClickHouse query error (projects table)", map[string]interface{}{
+						"path": r.URL.Path,
+						"method": r.Method,
+					})
+					http.Error(w, fmt.Sprintf("query error: %v", err), 500)
+					return
+				}
 			}
-			var projects []map[string]interface{}
-			for _, row := range rows {
-				projects = append(projects, map[string]interface{}{
-					"project_id": getString(row, "project_id"),
+			projects := make([]map[string]interface{}, 0)
+			seenProjects := make(map[string]bool) // Deduplicate by project_id
+			log.Printf("[DEBUG] Projects query: row_count=%d", len(rows))
+			for i, row := range rows {
+				projID := getString(row, "project_id")
+				log.Printf("[DEBUG] Processing project row %d: project_id=%s", i, projID)
+				if projID == "" || seenProjects[projID] {
+					log.Printf("[DEBUG] Skipping duplicate or empty project_id: %s", projID)
+					continue // Skip empty or duplicate project IDs
+				}
+				seenProjects[projID] = true
+				
+				projName := getString(row, "name")
+				// If name is empty or same as project_id, use a formatted name
+				if projName == "" || projName == projID {
+					projName = projID
+					// Format: "default-project" -> "Default Project"
+					if projID == "default-project" {
+						projName = "Default Project"
+					} else {
+						// Capitalize first letter and add spaces before capital letters
+						projName = strings.Title(strings.ReplaceAll(projID, "-", " "))
+					}
+				}
+				projMap := map[string]interface{}{
+					"project_id": projID,
+					"name":       projName,
 					"org_id":     getString(row, "org_id"),
-					"name":       getString(row, "name"),
-					"dsn":        getString(row, "dsn"),
-					"created_at": getString(row, "created_at"),
-					"updated_at": getString(row, "updated_at"),
-				})
+				}
+				// Only add these if they exist (from projects table fallback)
+				if dsn := getString(row, "dsn"); dsn != "" {
+					projMap["dsn"] = dsn
+				}
+				if createdAt := getString(row, "created_at"); createdAt != "" {
+					projMap["created_at"] = createdAt
+				}
+				if updatedAt := getString(row, "updated_at"); updatedAt != "" {
+					projMap["updated_at"] = updatedAt
+				}
+				projects = append(projects, projMap)
+			}
+			// Always return an array, never null
+			if projects == nil {
+				projects = []map[string]interface{}{}
 			}
 			json.NewEncoder(w).Encode(map[string]interface{}{"projects": projects})
 		case "POST":
@@ -1286,26 +1401,26 @@ func main() {
 		}
 		
 		// Build final aggregation query
-		// For span_count, we need to calculate expanded spans from call stack
-		// Join with spans_full to get call stack data and calculate expanded count
-		// Note: baseQuery must include span_id for the JOIN to work
-		query := "SELECT sm.trace_id, sm.service, min(sm.start_ts) as start_ts, max(sm.end_ts) as end_ts, "
-		query += "sum(sm.duration_ms) as duration_ms, "
-		// Calculate expanded span count: 1 (root) + significant call stack nodes
-		// We approximate by counting all stack nodes (will be filtered to significant ones during expansion)
-		// This gives a reasonable estimate without complex JSON parsing
-		// Use any() aggregate function since we're grouping
-		query += "CASE "
-		query += "  WHEN any(sf.stack) IS NULL OR any(sf.stack) = '[]' OR any(sf.stack) = '' THEN 1 "
-		query += "  WHEN JSONExtractString(any(sf.tags), '$.expand_spans') = 'false' THEN 1 "
-		query += "  ELSE 1 + toInt32(JSONLength(any(sf.stack))) "
-		query += "END as span_count, "
-		query += "any(sm.status) as status, any(sm.language) as language, any(sm.language_version) as language_version, "
-		query += "any(sm.framework) as framework, any(sm.framework_version) as framework_version "
-		query += "FROM (" + baseQuery + ") sm "
-		// Join on trace_id only - there's only one root span per trace in spans_min
-		query += "LEFT JOIN (SELECT DISTINCT trace_id, stack, tags FROM opa.spans_full) sf ON sm.trace_id = sf.trace_id "
-		query += "GROUP BY sm.trace_id, sm.service"
+		// span_count is simply COUNT(*) since all spans are pre-constructed and stored
+		// No need for complex JOIN or stack calculation - each span is stored as a separate row
+		var query string
+		if hasHttpFilters {
+			// baseQuery uses sm. prefix for HTTP filters
+			query = "SELECT sm.trace_id, sm.service, min(sm.start_ts) as start_ts, max(sm.end_ts) as end_ts, "
+			query += "sum(sm.duration_ms) as duration_ms, count(*) as span_count, "
+			query += "any(sm.status) as status, any(sm.language) as language, any(sm.language_version) as language_version, "
+			query += "any(sm.framework) as framework, any(sm.framework_version) as framework_version "
+			query += "FROM (" + baseQuery + ") sm "
+			query += "GROUP BY sm.trace_id, sm.service"
+		} else {
+			// baseQuery doesn't use prefix
+			query = "SELECT trace_id, service, min(start_ts) as start_ts, max(end_ts) as end_ts, "
+			query += "sum(duration_ms) as duration_ms, count(*) as span_count, "
+			query += "any(status) as status, any(language) as language, any(language_version) as language_version, "
+			query += "any(framework) as framework, any(framework_version) as framework_version "
+			query += "FROM (" + baseQuery + ") "
+			query += "GROUP BY trace_id, service"
+		}
 		
 		// Apply duration filters after grouping
 		if minDuration != "" {
@@ -2038,7 +2153,7 @@ func main() {
 		})
 	})
 	
-	// Service Map endpoint
+	// Service Map endpoint: build from spans directly
 	mux.HandleFunc("/api/service-map", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			http.Error(w, "method not allowed", 405)
@@ -2049,30 +2164,92 @@ func main() {
 		timeFrom := r.URL.Query().Get("from")
 		timeTo := r.URL.Query().Get("to")
 		
+		// Build tenant filter - skip tenant filtering if "all" is selected
+		var tenantFilter string
+		var tenantFilterChild string
+		var tenantFilterParent string
+		if ctx.IsAllTenants() {
+			// No tenant filtering - show all data
+			tenantFilter = ""
+			tenantFilterChild = ""
+			tenantFilterParent = ""
+		} else {
+			// Handle NULL/empty tenant IDs by treating them as default tenant
+			tenantFilter = fmt.Sprintf("(coalesce(nullif(organization_id, ''), 'default-org') = '%s' AND coalesce(nullif(project_id, ''), 'default-project') = '%s')",
+				escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID))
+			tenantFilterChild = fmt.Sprintf("(coalesce(nullif(child.organization_id, ''), 'default-org') = '%s' AND coalesce(nullif(child.project_id, ''), 'default-project') = '%s')",
+				escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID))
+			tenantFilterParent = fmt.Sprintf("(coalesce(nullif(parent.organization_id, ''), 'default-org') = '%s' AND coalesce(nullif(parent.project_id, ''), 'default-project') = '%s')",
+				escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID))
+		}
+		
+		// Default to last 24 hours if not specified
+		// URL decode the parameters first
 		if timeFrom == "" {
 			timeFrom = "now() - INTERVAL 24 HOUR"
 		} else {
-			timeFrom = fmt.Sprintf("'%s'", timeFrom)
+			// URL decode
+			if decoded, err := url.QueryUnescape(timeFrom); err == nil {
+				timeFrom = decoded
+			}
+			// If provided as datetime string (not a function), convert to DateTime
+			// But don't convert if it's a ClickHouse function like now() - INTERVAL
+			if !strings.HasPrefix(timeFrom, "now()") && !strings.HasPrefix(timeFrom, "parseDateTime") {
+				// Convert ISO 8601 or other datetime strings to DateTime
+				// Remove any existing quotes first
+				timeFromClean := strings.Trim(timeFrom, "'\"")
+				// parseDateTimeBestEffort can handle both ISO format and space-separated format
+				// No need to convert format, just use parseDateTimeBestEffort directly
+				timeFrom = fmt.Sprintf("parseDateTimeBestEffort('%s')", timeFromClean)
+				LogInfo("Service map: Converted timeFrom", map[string]interface{}{
+					"original": r.URL.Query().Get("from"),
+					"converted": timeFrom,
+				})
+			}
 		}
 		if timeTo == "" {
 			timeTo = "now()"
 		} else {
-			timeTo = fmt.Sprintf("'%s'", timeTo)
+			// URL decode
+			if decoded, err := url.QueryUnescape(timeTo); err == nil {
+				timeTo = decoded
+			}
+			if !strings.HasPrefix(timeTo, "now()") && !strings.HasPrefix(timeTo, "parseDateTime") {
+				// Convert ISO 8601 or other datetime strings to DateTime
+				// Remove any existing quotes first
+				timeToClean := strings.Trim(timeTo, "'\"")
+				// parseDateTimeBestEffort can handle both ISO format and space-separated format
+				// No need to convert format, just use parseDateTimeBestEffort directly
+				timeTo = fmt.Sprintf("parseDateTimeBestEffort('%s')", timeToClean)
+				LogInfo("Service map: Converted timeTo", map[string]interface{}{
+					"original": r.URL.Query().Get("to"),
+					"converted": timeTo,
+				})
+			}
 		}
 
-		// Get health thresholds
-		thresholdsQuery := fmt.Sprintf(`SELECT 
-			degraded_error_rate,
-			down_error_rate,
-			degraded_latency_ms,
-			down_latency_ms
-			FROM opa.service_map_thresholds
-			WHERE organization_id = '%s' AND project_id = '%s'
-			ORDER BY updated_at DESC
-			LIMIT 1`,
-			escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID))
+		// Get health thresholds (only if not "all")
+		var thresholdsQuery string
+		if ctx.IsAllTenants() {
+			// Use default thresholds when "all" is selected
+			thresholdsQuery = ""
+		} else {
+			thresholdsQuery = fmt.Sprintf(`SELECT 
+				degraded_error_rate,
+				down_error_rate,
+				degraded_latency_ms,
+				down_latency_ms
+				FROM opa.service_map_thresholds
+				WHERE organization_id = '%s' AND project_id = '%s'
+				ORDER BY updated_at DESC
+				LIMIT 1`,
+				escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID))
+		}
 		
-		thresholdRows, _ := queryClient.Query(thresholdsQuery)
+		var thresholdRows []map[string]interface{}
+		if thresholdsQuery != "" {
+			thresholdRows, _ = queryClient.Query(thresholdsQuery)
+		}
 		degradedErrorRate := 10.0
 		downErrorRate := 50.0
 		degradedLatency := 1000.0
@@ -2106,58 +2283,76 @@ func main() {
 		var nodes []map[string]interface{}
 		edges := make([]map[string]interface{}, 0)
 		services := make(map[string]bool)
-
-		// Get enhanced metrics from service_dependencies table with P95/P99 and throughput
-		// Calculate throughput using a subquery to avoid nested aggregate function error
-		enhancedQuery := fmt.Sprintf(`SELECT 
-			from_service,
-			to_service,
-			dependency_type,
-			dependency_target,
-			sum(call_count) as call_count,
-			avg(avg_duration_ms) as avg_latency_ms,
-			quantile(0.95)(avg_duration_ms) as p95_latency_ms,
-			quantile(0.99)(avg_duration_ms) as p99_latency_ms,
-			avg(error_rate) as error_rate,
-			toFloat64(sum(call_count)) / greatest(toFloat64(dateDiff('second', %s, %s)), 1.0) as throughput,
-			sum(bytes_sent) as bytes_sent,
-			sum(bytes_received) as bytes_received
-			FROM opa.service_dependencies
-			WHERE organization_id = '%s' AND project_id = '%s'
-				AND hour >= %s AND hour <= %s
-			GROUP BY from_service, to_service, dependency_type, dependency_target
-			ORDER BY from_service, to_service, dependency_type`,
-			timeFrom, timeTo, escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID), timeFrom, timeTo)
-
-		enhancedRows, enhancedErr := queryClient.Query(enhancedQuery)
 		externalDeps := make(map[string]bool) // Track external dependency nodes
-		if enhancedErr == nil && len(enhancedRows) > 0 {
-			// Use enhanced data from service_dependencies
-			for _, row := range enhancedRows {
+		
+		// Build service map directly from spans
+		// 1. Service-to-service relationships from parent-child spans
+		// 2. External dependencies from SQL/HTTP/cache/Redis data in spans
+		
+		// Step 1: Build service-to-service relationships from parent-child spans
+		// Use coalesce(nullif(...)) pattern to handle empty/null tenant IDs
+		// timeFrom and timeTo are already converted to DateTime or ClickHouse functions above
+		var serviceToServiceQuery string
+		if tenantFilterChild != "" {
+			serviceToServiceQuery = fmt.Sprintf(`SELECT 
+				parent.service as from_service,
+				child.service as to_service,
+				avg(child.duration_ms) as avg_latency_ms,
+				quantile(0.95)(child.duration_ms) as p95_latency_ms,
+				quantile(0.99)(child.duration_ms) as p99_latency_ms,
+				sum(CASE WHEN child.status = 'error' OR child.status = '0' THEN 1 ELSE 0 END) * 100.0 / count(*) as error_rate,
+				count(*) as call_count,
+				count(*) / greatest(toFloat64(dateDiff('second', %s, %s)), 1.0) as throughput,
+				sum(coalesce(child.bytes_sent, 0)) as bytes_sent,
+				sum(coalesce(child.bytes_received, 0)) as bytes_received
+				FROM opa.spans_min as child
+				INNER JOIN opa.spans_min as parent ON child.parent_id = parent.span_id AND child.trace_id = parent.trace_id
+				WHERE %s AND %s
+					AND child.service != parent.service
+					AND child.service != ''
+					AND parent.service != ''
+					AND child.start_ts >= %s AND child.start_ts <= %s
+				GROUP BY parent.service, child.service
+				ORDER BY call_count DESC`,
+				timeFrom, timeTo, // These are already converted to parseDateTimeBestEffort(...) or now() functions
+				tenantFilterChild, tenantFilterParent,
+				timeFrom, timeTo) // These are already converted to parseDateTimeBestEffort(...) or now() functions
+		} else {
+			serviceToServiceQuery = fmt.Sprintf(`SELECT 
+				parent.service as from_service,
+				child.service as to_service,
+				avg(child.duration_ms) as avg_latency_ms,
+				quantile(0.95)(child.duration_ms) as p95_latency_ms,
+				quantile(0.99)(child.duration_ms) as p99_latency_ms,
+				sum(CASE WHEN child.status = 'error' OR child.status = '0' THEN 1 ELSE 0 END) * 100.0 / count(*) as error_rate,
+				count(*) as call_count,
+				count(*) / greatest(toFloat64(dateDiff('second', %s, %s)), 1.0) as throughput,
+				sum(coalesce(child.bytes_sent, 0)) as bytes_sent,
+				sum(coalesce(child.bytes_received, 0)) as bytes_received
+				FROM opa.spans_min as child
+				INNER JOIN opa.spans_min as parent ON child.parent_id = parent.span_id AND child.trace_id = parent.trace_id
+				WHERE child.service != parent.service
+					AND child.service != ''
+					AND parent.service != ''
+					AND child.start_ts >= %s AND child.start_ts <= %s
+				GROUP BY parent.service, child.service
+				ORDER BY call_count DESC`,
+				timeFrom, timeTo, // These are already converted to parseDateTimeBestEffort(...) or now() functions
+				timeFrom, timeTo) // These are already converted to parseDateTimeBestEffort(...) or now() functions
+		}
+
+		serviceRows, serviceErr := queryClient.Query(serviceToServiceQuery)
+		if serviceErr == nil && len(serviceRows) > 0 {
+			for _, row := range serviceRows {
 				fromService := getString(row, "from_service")
 				toService := getString(row, "to_service")
-				dependencyType := getString(row, "dependency_type")
-				dependencyTarget := getString(row, "dependency_target")
 				
-				if fromService == "" {
+				if fromService == "" || toService == "" {
 					continue
 				}
 				
 				services[fromService] = true
-				
-				// For external dependencies, use dependency_target as the target node
-				if dependencyType != "" && dependencyType != "service" {
-					if dependencyTarget != "" {
-						toService = dependencyTarget
-					}
-					// Always add external dependency to the map, even if toService is empty
-					// This ensures external dependencies are tracked
-					if toService != "" {
-						externalDeps[toService] = true
-					}
-				} else {
-					services[toService] = true
-				}
+				services[toService] = true
 
 				avgLatency := getFloat64(row, "avg_latency_ms")
 				p95Latency := getFloat64(row, "p95_latency_ms")
@@ -2170,420 +2365,512 @@ func main() {
 
 				healthStatus := calculateHealthStatus(errorRate, avgLatency)
 
-				edge := map[string]interface{}{
+				// Calculate min/max latency and success rate
+				var minLatencyQuery string
+				if tenantFilterChild != "" {
+					minLatencyQuery = fmt.Sprintf(`SELECT min(duration_ms) as min_latency
+						FROM opa.spans_min as child
+						INNER JOIN opa.spans_min as parent ON child.parent_id = parent.span_id AND child.trace_id = parent.trace_id
+						WHERE %s
+							AND parent.service = '%s' AND child.service = '%s'
+							AND child.start_ts >= %s AND child.start_ts <= %s`,
+						tenantFilterChild,
+						escapeSQL(fromService), escapeSQL(toService), timeFrom, timeTo)
+				} else {
+					minLatencyQuery = fmt.Sprintf(`SELECT min(duration_ms) as min_latency
+						FROM opa.spans_min as child
+						INNER JOIN opa.spans_min as parent ON child.parent_id = parent.span_id AND child.trace_id = parent.trace_id
+						WHERE parent.service = '%s' AND child.service = '%s'
+							AND child.start_ts >= %s AND child.start_ts <= %s`,
+						escapeSQL(fromService), escapeSQL(toService), timeFrom, timeTo)
+				}
+				minLatencyRows, _ := queryClient.Query(minLatencyQuery)
+				minLatency := avgLatency
+				if len(minLatencyRows) > 0 {
+					if val := getFloat64(minLatencyRows[0], "min_latency"); val > 0 {
+						minLatency = val
+					}
+				}
+				
+				var maxLatencyQuery string
+				if tenantFilterChild != "" {
+					maxLatencyQuery = fmt.Sprintf(`SELECT max(duration_ms) as max_latency
+						FROM opa.spans_min as child
+						INNER JOIN opa.spans_min as parent ON child.parent_id = parent.span_id AND child.trace_id = parent.trace_id
+						WHERE %s
+							AND parent.service = '%s' AND child.service = '%s'
+							AND child.start_ts >= %s AND child.start_ts <= %s`,
+						tenantFilterChild,
+						escapeSQL(fromService), escapeSQL(toService), timeFrom, timeTo)
+				} else {
+					maxLatencyQuery = fmt.Sprintf(`SELECT max(duration_ms) as max_latency
+						FROM opa.spans_min as child
+						INNER JOIN opa.spans_min as parent ON child.parent_id = parent.span_id AND child.trace_id = parent.trace_id
+						WHERE parent.service = '%s' AND child.service = '%s'
+							AND child.start_ts >= %s AND child.start_ts <= %s`,
+						escapeSQL(fromService), escapeSQL(toService), timeFrom, timeTo)
+				}
+				maxLatencyRows, _ := queryClient.Query(maxLatencyQuery)
+				maxLatency := avgLatency
+				if len(maxLatencyRows) > 0 {
+					if val := getFloat64(maxLatencyRows[0], "max_latency"); val > 0 {
+						maxLatency = val
+					}
+				}
+				
+				successRate := 100.0 - errorRate
+				if successRate < 0 {
+					successRate = 0
+				}
+
+				edges = append(edges, map[string]interface{}{
 					"from":            fromService,
 					"to":              toService,
 					"avg_latency_ms":  avgLatency,
+					"min_latency_ms":  minLatency,
+					"max_latency_ms":  maxLatency,
 					"p95_latency_ms":  p95Latency,
 					"p99_latency_ms":  p99Latency,
 					"error_rate":      errorRate,
+					"success_rate":   successRate,
 					"call_count":      callCount,
 					"throughput":      throughput,
 					"bytes_sent":      bytesSent,
 					"bytes_received":  bytesReceived,
 					"health_status":   healthStatus,
-				}
-				
-				// Add dependency type info for external dependencies
-				if dependencyType != "" && dependencyType != "service" {
-					edge["dependency_type"] = dependencyType
-					edge["dependency_target"] = dependencyTarget
-				}
-				
-				edges = append(edges, edge)
+					"dependency_type": "service",
+				})
 			}
+		}
+		
+		// Step 2: Extract external dependencies from spans_full (SQL, HTTP, cache, Redis)
+		// Database dependencies from SQL data
+		// timeFrom and timeTo are already converted to DateTime or ClickHouse functions above
+		var dbQuery string
+		if tenantFilter != "" {
+			dbQuery = fmt.Sprintf(`SELECT 
+				service,
+				sql
+				FROM opa.spans_full
+				WHERE %s
+					AND sql != '' AND sql != '[]' AND sql != 'null'
+					AND start_ts >= %s AND start_ts <= %s
+				LIMIT 10000`,
+				tenantFilter, timeFrom, timeTo)
 		} else {
-			// Fallback: try service_map_metadata
-			query := fmt.Sprintf(`SELECT 
-				from_service,
-				to_service,
-				avg_latency_ms,
-				p95_latency_ms,
-				p99_latency_ms,
-				error_rate,
-				call_count,
-				throughput,
-				bytes_sent,
-				bytes_received,
-				health_status
-				FROM opa.service_map_metadata
-				WHERE organization_id = '%s' AND project_id = '%s'
-				ORDER BY from_service, to_service`,
-				escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID))
-
-			rows, err := queryClient.Query(query)
-			if err == nil && len(rows) > 0 {
-				for _, row := range rows {
-					fromService := getString(row, "from_service")
-					toService := getString(row, "to_service")
-					services[fromService] = true
-					services[toService] = true
-
-					edges = append(edges, map[string]interface{}{
-						"from":            fromService,
-						"to":              toService,
-						"avg_latency_ms":  getFloat64(row, "avg_latency_ms"),
-						"p95_latency_ms":  getFloat64(row, "p95_latency_ms"),
-						"p99_latency_ms":  getFloat64(row, "p99_latency_ms"),
-						"error_rate":      getFloat64(row, "error_rate"),
-						"call_count":      getUint64(row, "call_count"),
-						"throughput":      getFloat64(row, "throughput"),
-						"bytes_sent":      getUint64(row, "bytes_sent"),
-						"bytes_received":  getUint64(row, "bytes_received"),
-						"health_status":   getString(row, "health_status"),
-					})
-				}
-			} else {
-				// Final fallback: derive from spans_min
-				depsQuery := fmt.Sprintf(`SELECT 
-					parent.service as from_service,
-					child.service as to_service,
-					avg(child.duration_ms) as avg_latency_ms,
-					quantile(0.95)(child.duration_ms) as p95_latency_ms,
-					quantile(0.99)(child.duration_ms) as p99_latency_ms,
-					sum(CASE WHEN child.status = 'error' OR child.status = '0' THEN 1 ELSE 0 END) * 100.0 / count(*) as error_rate,
-					count(*) as call_count,
-					count(*) / (dateDiff('second', min(child.start_ts), max(child.start_ts)) + 1) as throughput,
-					sum(child.bytes_sent) as bytes_sent,
-					sum(child.bytes_received) as bytes_received
-					FROM opa.spans_min as child
-					INNER JOIN opa.spans_min as parent ON child.parent_id = parent.span_id AND child.trace_id = parent.trace_id
-					WHERE child.organization_id = '%s' AND child.project_id = '%s'
-						AND parent.organization_id = '%s' AND parent.project_id = '%s'
-						AND child.service != parent.service
-						AND child.start_ts >= %s AND child.start_ts <= %s
-						AND parent.start_ts >= %s AND parent.start_ts <= %s
-					GROUP BY parent.service, child.service
-					ORDER BY parent.service, child.service`,
-					escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID),
-					escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID),
-					timeFrom, timeTo, timeFrom, timeTo)
-
-				depsRows, depsErr := queryClient.Query(depsQuery)
-				if depsErr == nil {
-					for _, row := range depsRows {
-						fromService := getString(row, "from_service")
-						toService := getString(row, "to_service")
-						if fromService == "" || toService == "" {
-							continue
-						}
-						services[fromService] = true
-						services[toService] = true
-
-						avgLatency := getFloat64(row, "avg_latency_ms")
-						p95Latency := getFloat64(row, "p95_latency_ms")
-						p99Latency := getFloat64(row, "p99_latency_ms")
-						errorRate := getFloat64(row, "error_rate")
-						callCount := getUint64(row, "call_count")
-						throughput := getFloat64(row, "throughput")
-						bytesSent := getUint64(row, "bytes_sent")
-						bytesReceived := getUint64(row, "bytes_received")
-
-						healthStatus := calculateHealthStatus(errorRate, avgLatency)
-
-						edges = append(edges, map[string]interface{}{
-							"from":            fromService,
-							"to":              toService,
-							"avg_latency_ms":  avgLatency,
-							"p95_latency_ms":  p95Latency,
-							"p99_latency_ms":  p99Latency,
-							"error_rate":      errorRate,
-							"call_count":      callCount,
-							"throughput":      throughput,
-							"bytes_sent":      bytesSent,
-							"bytes_received":  bytesReceived,
-							"health_status":   healthStatus,
-						})
-					}
-				}
-
-				// Extract external dependencies from spans_min
-				// Database dependencies
-				dbQuery := fmt.Sprintf(`SELECT 
-					service as from_service,
-					db_system,
-					avg(duration_ms) as avg_latency_ms,
-					quantile(0.95)(duration_ms) as p95_latency_ms,
-					quantile(0.99)(duration_ms) as p99_latency_ms,
-					sum(CASE WHEN status = 'error' OR status = '0' THEN 1 ELSE 0 END) * 100.0 / count(*) as error_rate,
-					count(*) as call_count,
-					count(*) / (dateDiff('second', min(start_ts), max(start_ts)) + 1) as throughput,
-					sum(bytes_sent) as bytes_sent,
-					sum(bytes_received) as bytes_received
-					FROM opa.spans_min
-					WHERE organization_id = '%s' AND project_id = '%s'
-						AND db_system IS NOT NULL AND db_system != ''
-						AND start_ts >= %s AND start_ts <= %s
-					GROUP BY service, db_system
-					ORDER BY service, db_system`,
-					escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID), timeFrom, timeTo)
-
-				dbRows, _ := queryClient.Query(dbQuery)
-				for _, row := range dbRows {
-					fromService := getString(row, "from_service")
-					dbSystem := getString(row, "db_system")
-					if fromService == "" || dbSystem == "" {
-						continue
-					}
-					services[fromService] = true
-					target := fmt.Sprintf("db:%s", dbSystem)
-					externalDeps[target] = true
-
-					avgLatency := getFloat64(row, "avg_latency_ms")
-					p95Latency := getFloat64(row, "p95_latency_ms")
-					p99Latency := getFloat64(row, "p99_latency_ms")
-					errorRate := getFloat64(row, "error_rate")
-					callCount := getUint64(row, "call_count")
-					throughput := getFloat64(row, "throughput")
-					bytesSent := getUint64(row, "bytes_sent")
-					bytesReceived := getUint64(row, "bytes_received")
-					healthStatus := calculateHealthStatus(errorRate, avgLatency)
-
-					edges = append(edges, map[string]interface{}{
-						"from":            fromService,
-						"to":              target,
-						"avg_latency_ms":  avgLatency,
-						"p95_latency_ms":  p95Latency,
-						"p99_latency_ms":  p99Latency,
-						"error_rate":      errorRate,
-						"call_count":      callCount,
-						"throughput":      throughput,
-						"bytes_sent":      bytesSent,
-						"bytes_received":  bytesReceived,
-						"health_status":   healthStatus,
-						"dependency_type": "database",
-						"dependency_target": target,
-					})
-				}
-
-				// HTTP/cURL dependencies
-				httpQuery := fmt.Sprintf(`SELECT 
-					service as from_service,
-					concat(coalesce(url_scheme, 'http'), '://', url_host) as target_url,
-					avg(duration_ms) as avg_latency_ms,
-					quantile(0.95)(duration_ms) as p95_latency_ms,
-					quantile(0.99)(duration_ms) as p99_latency_ms,
-					sum(CASE WHEN status = 'error' OR status = '0' THEN 1 ELSE 0 END) * 100.0 / count(*) as error_rate,
-					count(*) as call_count,
-					count(*) / (dateDiff('second', min(start_ts), max(start_ts)) + 1) as throughput,
-					sum(bytes_sent) as bytes_sent,
-					sum(bytes_received) as bytes_received
-					FROM opa.spans_min
-					WHERE organization_id = '%s' AND project_id = '%s'
-						AND url_host IS NOT NULL AND url_host != ''
-						AND url_host != service
-						AND start_ts >= %s AND start_ts <= %s
-					GROUP BY service, url_scheme, url_host
-					ORDER BY service, url_scheme, url_host`,
-					escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID), timeFrom, timeTo)
-
-				httpRows, _ := queryClient.Query(httpQuery)
-				for _, row := range httpRows {
-					fromService := getString(row, "from_service")
-					target := getString(row, "target_url")
-					if fromService == "" || target == "" {
-						continue
-					}
-					services[fromService] = true
-					externalDeps[target] = true
-
-					avgLatency := getFloat64(row, "avg_latency_ms")
-					p95Latency := getFloat64(row, "p95_latency_ms")
-					p99Latency := getFloat64(row, "p99_latency_ms")
-					errorRate := getFloat64(row, "error_rate")
-					callCount := getUint64(row, "call_count")
-					throughput := getFloat64(row, "throughput")
-					bytesSent := getUint64(row, "bytes_sent")
-					bytesReceived := getUint64(row, "bytes_received")
-					healthStatus := calculateHealthStatus(errorRate, avgLatency)
-
-					edges = append(edges, map[string]interface{}{
-						"from":            fromService,
-						"to":              target,
-						"avg_latency_ms":  avgLatency,
-						"p95_latency_ms":  p95Latency,
-						"p99_latency_ms":  p99Latency,
-						"error_rate":      errorRate,
-						"call_count":      callCount,
-						"throughput":      throughput,
-						"bytes_sent":      bytesSent,
-						"bytes_received":  bytesReceived,
-						"health_status":   healthStatus,
-						"dependency_type": "http",
-						"dependency_target": target,
-					})
-				}
-
-				// Also check spans_full for HTTP requests stored in http field (cURL requests)
-				// This handles cases where HTTP requests are in the JSON field but not extracted to url_host/url_scheme
-				httpFullQuery := fmt.Sprintf(`SELECT 
-					service,
-					http,
-					start_ts,
-					duration_ms,
-					status
-					FROM opa.spans_full
-					WHERE organization_id = '%s' AND project_id = '%s'
-						AND http != '' AND http != '[]' AND http != 'null'
-						AND start_ts >= %s AND start_ts <= %s
-					LIMIT 1000`,
-					escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID), timeFrom, timeTo)
-
-				httpFullRows, _ := queryClient.Query(httpFullQuery)
-				httpCallsMap := make(map[string]map[string]interface{}) // key: "service->url"
-
-				for _, row := range httpFullRows {
-					fromService := getString(row, "service")
-					httpData := getString(row, "http")
-					if fromService == "" || httpData == "" {
-						continue
-					}
-
-					// Parse HTTP requests JSON array
-					var httpRequests []map[string]interface{}
-					if err := json.Unmarshal([]byte(httpData), &httpRequests); err != nil {
-						continue
-					}
-
-					for _, req := range httpRequests {
-						url := ""
-						if u, ok := req["url"].(string); ok && u != "" {
-							url = u
-						} else if u, ok := req["URL"].(string); ok && u != "" {
-							url = u
-						} else if host, ok := req["host"].(string); ok && host != "" {
-							scheme := "http"
-							if s, ok := req["scheme"].(string); ok && s != "" {
-								scheme = s
-							}
-							url = fmt.Sprintf("%s://%s", scheme, host)
-						}
-
-						if url == "" {
-							continue
-						}
-
-						// Skip internal calls
-						if strings.Contains(url, fromService) {
-							continue
-						}
-
-						key := fmt.Sprintf("%s->%s", fromService, url)
-						call, exists := httpCallsMap[key]
-						if !exists {
-							call = map[string]interface{}{
-								"from_service": fromService,
-								"target":       url,
-								"call_count":   int64(0),
-								"total_duration": 0.0,
-								"error_count":  int64(0),
-								"total_bytes_sent": int64(0),
-								"total_bytes_received": int64(0),
-							}
-							httpCallsMap[key] = call
-						}
-
-						call["call_count"] = call["call_count"].(int64) + 1
-						if duration, ok := req["duration_ms"].(float64); ok {
-							call["total_duration"] = call["total_duration"].(float64) + duration
-						} else if duration, ok := req["duration"].(float64); ok {
-							call["total_duration"] = call["total_duration"].(float64) + duration*1000
-						}
-						if status, ok := req["status"].(string); ok && (status == "error" || status == "0") {
-							call["error_count"] = call["error_count"].(int64) + 1
-						}
-						if sent, ok := req["bytes_sent"].(float64); ok {
-							call["total_bytes_sent"] = call["total_bytes_sent"].(int64) + int64(sent)
-						}
-						if recv, ok := req["bytes_received"].(float64); ok {
-							call["total_bytes_received"] = call["total_bytes_received"].(int64) + int64(recv)
-						}
-					}
-				}
-
-				// Convert aggregated HTTP calls to edges
-				for _, call := range httpCallsMap {
-					fromService := call["from_service"].(string)
-					target := call["target"].(string)
-					callCount := call["call_count"].(int64)
-					if callCount == 0 {
-						continue
-					}
-
-					services[fromService] = true
-					externalDeps[target] = true
-
-					avgLatency := call["total_duration"].(float64) / float64(callCount)
-					errorRate := float64(call["error_count"].(int64)) / float64(callCount) * 100.0
-					healthStatus := calculateHealthStatus(errorRate, avgLatency)
-
-					edges = append(edges, map[string]interface{}{
-						"from":            fromService,
-						"to":              target,
-						"avg_latency_ms":  avgLatency,
-						"p95_latency_ms":  avgLatency, // Approximate
-						"p99_latency_ms":  avgLatency, // Approximate
-						"error_rate":      errorRate,
-						"call_count":      callCount,
-						"throughput":      0.0, // Not calculated for this fallback
-						"bytes_sent":      call["total_bytes_sent"],
-						"bytes_received":  call["total_bytes_received"],
-						"health_status":   healthStatus,
-						"dependency_type": "http",
-						"dependency_target": target,
-					})
-				}
-			}
+			dbQuery = fmt.Sprintf(`SELECT 
+				service,
+				sql
+				FROM opa.spans_full
+				WHERE sql != '' AND sql != '[]' AND sql != 'null'
+					AND start_ts >= %s AND start_ts <= %s
+				LIMIT 10000`,
+				timeFrom, timeTo)
 		}
-
-		// If no edges found, at least show all services that exist
-		if len(edges) == 0 {
-			allServicesQuery := fmt.Sprintf(`SELECT DISTINCT service
-				FROM opa.spans_min
-				WHERE organization_id = '%s' AND project_id = '%s'
-					AND start_ts >= %s AND start_ts <= %s`,
-				escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID), timeFrom, timeTo)
+		
+		dbRows, dbErr := queryClient.Query(dbQuery)
+		if dbErr != nil {
+			LogError(dbErr, "Failed to query database dependencies", map[string]interface{}{
+				"query": dbQuery,
+			})
+		}
+		dbDepsMap := make(map[string]map[string]interface{}) // key: "service->target"
+		
+		for _, row := range dbRows {
+			fromService := getString(row, "service")
+			sqlData := getString(row, "sql")
+			if fromService == "" || sqlData == "" {
+				continue
+			}
 			
-			serviceRows, _ := queryClient.Query(allServicesQuery)
-			for _, row := range serviceRows {
-				service := getString(row, "service")
-				if service != "" {
-					services[service] = true
+			var sqlArray []map[string]interface{}
+			if err := json.Unmarshal([]byte(sqlData), &sqlArray); err != nil {
+				continue
+			}
+			
+			for _, sqlItem := range sqlArray {
+				dbSystem := ""
+				if db, ok := sqlItem["db_system"].(string); ok && db != "" {
+					dbSystem = db
+				} else if db, ok := sqlItem["dbSystem"].(string); ok && db != "" {
+					dbSystem = db
+				}
+				
+				if dbSystem == "" {
+					continue
+				}
+				
+				// Extract host if available
+				dbHost := ""
+				if host, ok := sqlItem["db_host"].(string); ok && host != "" {
+					dbHost = host
+				}
+				
+				// Build target identifier
+				target := ""
+				if dbHost != "" {
+					target = fmt.Sprintf("%s://%s", dbSystem, dbHost)
+				} else {
+					target = fmt.Sprintf("db:%s", dbSystem)
+				}
+				
+				key := fmt.Sprintf("%s->%s", fromService, target)
+				dep, exists := dbDepsMap[key]
+				if !exists {
+					dep = map[string]interface{}{
+						"from_service": fromService,
+						"target":       target,
+						"call_count":   int64(0),
+						"total_duration": 0.0,
+						"error_count":  int64(0),
+					}
+					dbDepsMap[key] = dep
+				}
+				
+				dep["call_count"] = dep["call_count"].(int64) + 1
+				if duration, ok := sqlItem["duration_ms"].(float64); ok {
+					dep["total_duration"] = dep["total_duration"].(float64) + duration
+				} else if duration, ok := sqlItem["duration"].(float64); ok {
+					dep["total_duration"] = dep["total_duration"].(float64) + duration*1000
+				}
+				if status, ok := sqlItem["status"].(string); ok && (status == "error" || status == "0") {
+					dep["error_count"] = dep["error_count"].(int64) + 1
 				}
 			}
 		}
+		
+		// Convert database dependencies to edges
+		for _, dep := range dbDepsMap {
+			fromService := dep["from_service"].(string)
+			target := dep["target"].(string)
+			callCount := dep["call_count"].(int64)
+			if callCount == 0 {
+				continue
+			}
+			
+			services[fromService] = true
+			externalDeps[target] = true
+			
+			avgLatency := dep["total_duration"].(float64) / float64(callCount)
+			errorRate := float64(dep["error_count"].(int64)) / float64(callCount) * 100.0
+			healthStatus := calculateHealthStatus(errorRate, avgLatency)
+			
+			successRate := 100.0 - errorRate
+			if successRate < 0 {
+				successRate = 0
+			}
 
-		// Create nodes for all services
+			edges = append(edges, map[string]interface{}{
+				"from":            fromService,
+				"to":              target,
+				"avg_latency_ms":  avgLatency,
+				"min_latency_ms":  avgLatency,
+				"max_latency_ms":  avgLatency,
+				"p95_latency_ms":  avgLatency,
+				"p99_latency_ms":  avgLatency,
+				"error_rate":      errorRate,
+				"success_rate":   successRate,
+				"call_count":      callCount,
+				"throughput":      0.0,
+				"bytes_sent":      0,
+				"bytes_received":  0,
+				"health_status":   healthStatus,
+				"dependency_type": "database",
+				"dependency_target": target,
+			})
+		}
+		
+		// HTTP dependencies from spans_full
+		// timeFrom and timeTo are already converted to DateTime or ClickHouse functions above
+		var httpQuery string
+		if tenantFilter != "" {
+			httpQuery = fmt.Sprintf(`SELECT 
+				service,
+				http
+				FROM opa.spans_full
+				WHERE %s
+					AND http != '' AND http != '[]' AND http != 'null'
+					AND start_ts >= %s AND start_ts <= %s
+				LIMIT 10000`,
+				tenantFilter, timeFrom, timeTo)
+		} else {
+			httpQuery = fmt.Sprintf(`SELECT 
+				service,
+				http
+				FROM opa.spans_full
+				WHERE http != '' AND http != '[]' AND http != 'null'
+					AND start_ts >= %s AND start_ts <= %s
+				LIMIT 10000`,
+				timeFrom, timeTo)
+		}
+		
+		httpRows, httpErr := queryClient.Query(httpQuery)
+		if httpErr != nil {
+			LogError(httpErr, "Failed to query HTTP dependencies", map[string]interface{}{
+				"query": httpQuery,
+			})
+		}
+		httpDepsMap := make(map[string]map[string]interface{}) // key: "service->url"
+		
+		for _, row := range httpRows {
+			fromService := getString(row, "service")
+			httpData := getString(row, "http")
+			if fromService == "" || httpData == "" {
+				continue
+			}
+			
+			var httpArray []map[string]interface{}
+			if err := json.Unmarshal([]byte(httpData), &httpArray); err != nil {
+				continue
+			}
+			
+			for _, req := range httpArray {
+				url := ""
+				if u, ok := req["url"].(string); ok && u != "" {
+					url = u
+				} else if u, ok := req["URL"].(string); ok && u != "" {
+					url = u
+				} else if host, ok := req["host"].(string); ok && host != "" {
+					scheme := "http"
+					if s, ok := req["scheme"].(string); ok && s != "" {
+						scheme = s
+					}
+					url = fmt.Sprintf("%s://%s", scheme, host)
+				}
+				
+				if url == "" {
+					continue
+				}
+				
+				// Skip internal calls to the same service (but allow calls to other services)
+				// Only skip if the URL host exactly matches the service name
+				if url == fromService || strings.HasPrefix(url, fromService+":") || strings.HasPrefix(url, fromService+"/") {
+					continue
+				}
+				
+				// Extract just the base URL (host) for grouping
+				baseURL := url
+				if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
+					parts := strings.Split(strings.TrimPrefix(strings.TrimPrefix(url, "http://"), "https://"), "/")
+					if len(parts) > 0 {
+						baseURL = strings.Split(url, "/")[0] + "//" + parts[0]
+					}
+				}
+				
+				key := fmt.Sprintf("%s->%s", fromService, baseURL)
+				dep, exists := httpDepsMap[key]
+				if !exists {
+					dep = map[string]interface{}{
+						"from_service": fromService,
+						"target":       baseURL,
+						"call_count":   int64(0),
+						"total_duration": 0.0,
+						"error_count":  int64(0),
+						"total_bytes_sent": int64(0),
+						"total_bytes_received": int64(0),
+					}
+					httpDepsMap[key] = dep
+				}
+				
+				dep["call_count"] = dep["call_count"].(int64) + 1
+				if duration, ok := req["duration_ms"].(float64); ok {
+					dep["total_duration"] = dep["total_duration"].(float64) + duration
+				} else if duration, ok := req["duration"].(float64); ok {
+					dep["total_duration"] = dep["total_duration"].(float64) + duration*1000
+				}
+				if status, ok := req["status"].(string); ok && (status == "error" || status == "0") {
+					dep["error_count"] = dep["error_count"].(int64) + 1
+				} else if statusCode, ok := req["status_code"].(float64); ok && statusCode >= 400 {
+					dep["error_count"] = dep["error_count"].(int64) + 1
+				}
+				if sent, ok := req["bytes_sent"].(float64); ok {
+					dep["total_bytes_sent"] = dep["total_bytes_sent"].(int64) + int64(sent)
+				}
+				if recv, ok := req["bytes_received"].(float64); ok {
+					dep["total_bytes_received"] = dep["total_bytes_received"].(int64) + int64(recv)
+				}
+			}
+		}
+		
+		// Convert HTTP dependencies to edges
+		for _, dep := range httpDepsMap {
+			fromService := dep["from_service"].(string)
+			target := dep["target"].(string)
+			callCount := dep["call_count"].(int64)
+			if callCount == 0 {
+				continue
+			}
+			
+			services[fromService] = true
+			externalDeps[target] = true
+			
+			avgLatency := dep["total_duration"].(float64) / float64(callCount)
+			errorRate := float64(dep["error_count"].(int64)) / float64(callCount) * 100.0
+			healthStatus := calculateHealthStatus(errorRate, avgLatency)
+			
+			successRate := 100.0 - errorRate
+			if successRate < 0 {
+				successRate = 0
+			}
+
+			edges = append(edges, map[string]interface{}{
+				"from":            fromService,
+				"to":              target,
+				"avg_latency_ms":  avgLatency,
+				"min_latency_ms":  avgLatency,
+				"max_latency_ms":  avgLatency,
+				"p95_latency_ms":  avgLatency,
+				"p99_latency_ms":  avgLatency,
+				"error_rate":      errorRate,
+				"success_rate":   successRate,
+				"call_count":      callCount,
+				"throughput":      0.0,
+				"bytes_sent":      dep["total_bytes_sent"],
+				"bytes_received":  dep["total_bytes_received"],
+				"health_status":   healthStatus,
+				"dependency_type": "http",
+				"dependency_target": target,
+			})
+		}
+		
+		// Always ensure services with external dependencies are included
+		// Also add all services that have spans in the time range
+		var allServicesQuery string
+		if tenantFilter != "" {
+			allServicesQuery = fmt.Sprintf(`SELECT DISTINCT service
+				FROM opa.spans_min
+				WHERE %s
+					AND start_ts >= %s AND start_ts <= %s`,
+				tenantFilter, timeFrom, timeTo)
+		} else {
+			allServicesQuery = fmt.Sprintf(`SELECT DISTINCT service
+				FROM opa.spans_min
+				WHERE start_ts >= %s AND start_ts <= %s`,
+				timeFrom, timeTo)
+		}
+		
+		serviceRows, _ = queryClient.Query(allServicesQuery)
+		for _, row := range serviceRows {
+			service := getString(row, "service")
+			if service != "" {
+				services[service] = true
+			}
+		}
+		
+		// Also add services that have external dependencies (from edges we just created)
+		for _, edge := range edges {
+			if from, ok := edge["from"].(string); ok && from != "" {
+				services[from] = true
+			}
+		}
+
+		// Create nodes for all services with complete metrics
 		for service := range services {
-			// Get service stats
-			statsQuery := fmt.Sprintf(`SELECT 
-				count(*) as total_spans,
-				avg(duration_ms) as avg_duration,
-				sum(CASE WHEN status = 'error' OR status = '0' THEN 1 ELSE 0 END) * 100.0 / count(*) as error_rate
-				FROM opa.spans_min 
-				WHERE organization_id = '%s' AND project_id = '%s' AND service = '%s' AND start_ts >= %s AND start_ts <= %s`,
-				escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID), escapeSQL(service), timeFrom, timeTo)
+			// Get comprehensive service stats
+			// timeFrom and timeTo are already converted to DateTime or ClickHouse functions above
+			var statsQuery string
+			if tenantFilter != "" {
+				statsQuery = fmt.Sprintf(`SELECT 
+					count(*) as total_spans,
+					avg(duration_ms) as avg_duration,
+					min(duration_ms) as min_duration,
+					max(duration_ms) as max_duration,
+					quantile(0.95)(duration_ms) as p95_duration,
+					quantile(0.99)(duration_ms) as p99_duration,
+					sum(CASE WHEN status = 'error' OR status = '0' THEN 1 ELSE 0 END) * 100.0 / count(*) as error_rate,
+					sum(coalesce(bytes_sent, 0)) + sum(coalesce(bytes_received, 0)) as total_traffic,
+					count(*) / greatest(toFloat64(dateDiff('second', %s, %s)), 1.0) as throughput
+					FROM opa.spans_min 
+					WHERE %s AND service = '%s' AND start_ts >= %s AND start_ts <= %s`,
+					timeFrom, timeTo, // These are already converted to parseDateTimeBestEffort(...) or now() functions
+					tenantFilter, escapeSQL(service), timeFrom, timeTo) // These are already converted
+			} else {
+				statsQuery = fmt.Sprintf(`SELECT 
+					count(*) as total_spans,
+					avg(duration_ms) as avg_duration,
+					min(duration_ms) as min_duration,
+					max(duration_ms) as max_duration,
+					quantile(0.95)(duration_ms) as p95_duration,
+					quantile(0.99)(duration_ms) as p99_duration,
+					sum(CASE WHEN status = 'error' OR status = '0' THEN 1 ELSE 0 END) * 100.0 / count(*) as error_rate,
+					sum(coalesce(bytes_sent, 0)) + sum(coalesce(bytes_received, 0)) as total_traffic,
+					count(*) / greatest(toFloat64(dateDiff('second', %s, %s)), 1.0) as throughput
+					FROM opa.spans_min 
+					WHERE service = '%s' AND start_ts >= %s AND start_ts <= %s`,
+					timeFrom, timeTo, // These are already converted to parseDateTimeBestEffort(...) or now() functions
+					escapeSQL(service), timeFrom, timeTo) // These are already converted
+			}
 			
 			statsRows, _ := queryClient.Query(statsQuery)
 			healthStatus := "healthy"
-			var avgDuration, errorRate float64
+			var avgDuration, errorRate, minDuration, maxDuration, p95Duration, p99Duration, throughput, totalTraffic float64
 			var totalSpans uint64
 			if len(statsRows) > 0 {
 				errorRate = getFloat64(statsRows[0], "error_rate")
 				avgDuration = getFloat64(statsRows[0], "avg_duration")
+				minDuration = getFloat64(statsRows[0], "min_duration")
+				maxDuration = getFloat64(statsRows[0], "max_duration")
+				p95Duration = getFloat64(statsRows[0], "p95_duration")
+				p99Duration = getFloat64(statsRows[0], "p99_duration")
+				throughput = getFloat64(statsRows[0], "throughput")
+				totalTraffic = getFloat64(statsRows[0], "total_traffic")
 				totalSpans = getUint64(statsRows[0], "total_spans")
 				healthStatus = calculateHealthStatus(errorRate, avgDuration)
 			}
 
-			nodes = append(nodes, map[string]interface{}{
-				"id":            service,
-				"service":       service,
-				"health_status": healthStatus,
-				"avg_duration":  avgDuration,
-				"error_rate":    errorRate,
-				"total_spans":   totalSpans,
-				"node_type":     "service",
-			})
+			// Count incoming and outgoing calls
+			incomingCalls := uint64(0)
+			outgoingCalls := uint64(0)
+			for _, edge := range edges {
+				if to, ok := edge["to"].(string); ok && to == service {
+					if count, ok := edge["call_count"].(uint64); ok {
+						incomingCalls += count
+					} else if count, ok := edge["call_count"].(int64); ok {
+						incomingCalls += uint64(count)
+					}
+				}
+				if from, ok := edge["from"].(string); ok && from == service {
+					if count, ok := edge["call_count"].(uint64); ok {
+						outgoingCalls += count
+					} else if count, ok := edge["call_count"].(int64); ok {
+						outgoingCalls += uint64(count)
+					}
+				}
+			}
+
+			nodeData := map[string]interface{}{
+				"id":              service,
+				"service":         service,
+				"health_status":   healthStatus,
+				"avg_duration":    avgDuration,
+				"error_rate":      errorRate,
+				"total_spans":     totalSpans,
+				"incoming_calls":  incomingCalls,
+				"outgoing_calls":  outgoingCalls,
+				"node_type":       "service",
+			}
+			
+			// Add optional fields only if they have meaningful values
+			if minDuration > 0 {
+				nodeData["min_duration"] = minDuration
+			}
+			if maxDuration > 0 {
+				nodeData["max_duration"] = maxDuration
+			}
+			if p95Duration > 0 {
+				nodeData["p95_duration"] = p95Duration
+			}
+			if p99Duration > 0 {
+				nodeData["p99_duration"] = p99Duration
+			}
+			if throughput > 0 {
+				nodeData["throughput"] = throughput
+			}
+			if totalTraffic > 0 {
+				nodeData["total_traffic"] = totalTraffic
+			}
+			
+			nodes = append(nodes, nodeData)
 		}
 
 		// Create nodes for external dependencies
@@ -2626,6 +2913,18 @@ func main() {
 			}
 			healthStatus := calculateHealthStatus(errorRate, avgLatency)
 
+			// Count incoming calls for external dependencies
+			incomingCalls := uint64(0)
+			for _, edge := range edges {
+				if to, ok := edge["to"].(string); ok && to == extDep {
+					if count, ok := edge["call_count"].(uint64); ok {
+						incomingCalls += count
+					} else if count, ok := edge["call_count"].(int64); ok {
+						incomingCalls += uint64(count)
+					}
+				}
+			}
+
 			nodes = append(nodes, map[string]interface{}{
 				"id":            extDep,
 				"service":       extDep,
@@ -2633,6 +2932,8 @@ func main() {
 				"node_type":     depType,
 				"avg_duration":  avgLatency,
 				"error_rate":    errorRate,
+				"incoming_calls": incomingCalls,
+				"outgoing_calls": uint64(0), // External deps don't make outgoing calls
 			})
 		}
 
@@ -3487,6 +3788,7 @@ func main() {
 			return
 		}
 		
+		ctx, _ := ExtractTenantContext(r, queryClient)
 		service := r.URL.Query().Get("service")
 		timeFrom := r.URL.Query().Get("from")
 		timeTo := r.URL.Query().Get("to")
@@ -3494,6 +3796,17 @@ func main() {
 		limit := r.URL.Query().Get("limit")
 		if limit == "" {
 			limit = "100"
+		}
+		
+		// Build tenant filter - skip tenant filtering if "all" is selected
+		var tenantFilter string
+		if ctx.IsAllTenants() {
+			// No tenant filtering - show all data
+			tenantFilter = ""
+		} else {
+			// Handle NULL/empty tenant IDs by treating them as default tenant
+			tenantFilter = fmt.Sprintf("(coalesce(nullif(organization_id, ''), 'default-org') = '%s' AND coalesce(nullif(project_id, ''), 'default-project') = '%s')",
+				escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID))
 		}
 		
 		query := `SELECT 
@@ -3505,6 +3818,9 @@ func main() {
 			max(duration_ms) as max_duration
 			FROM opa.spans_min WHERE query_fingerprint IS NOT NULL AND query_fingerprint != ''`
 		
+		if tenantFilter != "" {
+			query += " AND " + tenantFilter
+		}
 		if service != "" {
 			query += fmt.Sprintf(" AND service = '%s'", strings.ReplaceAll(service, "'", "''"))
 		}
@@ -3557,6 +3873,7 @@ func main() {
 			return
 		}
 		
+		ctx, _ := ExtractTenantContext(r, queryClient)
 		parts := strings.Split(r.URL.Path, "/")
 		if len(parts) < 5 {
 			http.Error(w, "bad request", 400)
@@ -3565,14 +3882,36 @@ func main() {
 		fingerprint := strings.Join(parts[4:], "/")
 		fingerprintEscaped := strings.ReplaceAll(fingerprint, "'", "''")
 		
+		// Build tenant filter - skip tenant filtering if "all" is selected
+		var tenantFilter string
+		if ctx.IsAllTenants() {
+			// No tenant filtering - show all data
+			tenantFilter = ""
+		} else {
+			// Handle NULL/empty tenant IDs by treating them as default tenant
+			tenantFilter = fmt.Sprintf("(coalesce(nullif(organization_id, ''), 'default-org') = '%s' AND coalesce(nullif(project_id, ''), 'default-project') = '%s')",
+				escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID))
+		}
+		
 		// Get query stats
-		query := fmt.Sprintf(`SELECT 
-			count(*) as total_executions,
-			avg(duration_ms) as avg_duration,
-			quantile(0.95)(duration_ms) as p95_duration,
-			quantile(0.99)(duration_ms) as p99_duration,
-			max(duration_ms) as max_duration
-			FROM opa.spans_min WHERE query_fingerprint = '%s'`, fingerprintEscaped)
+		var query string
+		if tenantFilter != "" {
+			query = fmt.Sprintf(`SELECT 
+				count(*) as total_executions,
+				avg(duration_ms) as avg_duration,
+				quantile(0.95)(duration_ms) as p95_duration,
+				quantile(0.99)(duration_ms) as p99_duration,
+				max(duration_ms) as max_duration
+				FROM opa.spans_min WHERE query_fingerprint = '%s' AND %s`, fingerprintEscaped, tenantFilter)
+		} else {
+			query = fmt.Sprintf(`SELECT 
+				count(*) as total_executions,
+				avg(duration_ms) as avg_duration,
+				quantile(0.95)(duration_ms) as p95_duration,
+				quantile(0.99)(duration_ms) as p99_duration,
+				max(duration_ms) as max_duration
+				FROM opa.spans_min WHERE query_fingerprint = '%s'`, fingerprintEscaped)
+		}
 		
 		rows, err := queryClient.Query(query)
 		if err != nil || len(rows) == 0 {
@@ -3584,11 +3923,21 @@ func main() {
 		
 		// Get example query from spans_full by matching trace_id with spans_min
 		exampleQuery := fingerprint // Use fingerprint as default
-		exampleRows, _ := queryClient.Query(fmt.Sprintf(`SELECT sql FROM opa.spans_full 
-			WHERE trace_id IN (
-				SELECT trace_id FROM opa.spans_min 
-				WHERE query_fingerprint = '%s' LIMIT 1
-			) AND sql != '' LIMIT 1`, fingerprintEscaped))
+		var exampleQuerySQL string
+		if tenantFilter != "" {
+			exampleQuerySQL = fmt.Sprintf(`SELECT sql FROM opa.spans_full 
+				WHERE trace_id IN (
+					SELECT trace_id FROM opa.spans_min 
+					WHERE query_fingerprint = '%s' AND %s LIMIT 1
+				) AND %s AND sql != '' LIMIT 1`, fingerprintEscaped, tenantFilter, tenantFilter)
+		} else {
+			exampleQuerySQL = fmt.Sprintf(`SELECT sql FROM opa.spans_full 
+				WHERE trace_id IN (
+					SELECT trace_id FROM opa.spans_min 
+					WHERE query_fingerprint = '%s' LIMIT 1
+				) AND sql != '' LIMIT 1`, fingerprintEscaped)
+		}
+		exampleRows, _ := queryClient.Query(exampleQuerySQL)
 		if len(exampleRows) > 0 {
 			sqlStr := getString(exampleRows[0], "sql")
 			if sqlStr != "" {
@@ -3604,13 +3953,24 @@ func main() {
 		}
 		
 		// Performance trends
-		trendsQuery := fmt.Sprintf(`SELECT 
-			toStartOfHour(start_ts) as time,
-			avg(duration_ms) as avg_duration,
-			quantile(0.95)(duration_ms) as p95_duration
-			FROM opa.spans_min WHERE query_fingerprint = '%s' 
-			AND start_ts >= now() - INTERVAL 7 DAY
-			GROUP BY time ORDER BY time`, fingerprintEscaped)
+		var trendsQuery string
+		if tenantFilter != "" {
+			trendsQuery = fmt.Sprintf(`SELECT 
+				toStartOfHour(start_ts) as time,
+				avg(duration_ms) as avg_duration,
+				quantile(0.95)(duration_ms) as p95_duration
+				FROM opa.spans_min WHERE query_fingerprint = '%s' AND %s
+				AND start_ts >= now() - INTERVAL 7 DAY
+				GROUP BY time ORDER BY time`, fingerprintEscaped, tenantFilter)
+		} else {
+			trendsQuery = fmt.Sprintf(`SELECT 
+				toStartOfHour(start_ts) as time,
+				avg(duration_ms) as avg_duration,
+				quantile(0.95)(duration_ms) as p95_duration
+				FROM opa.spans_min WHERE query_fingerprint = '%s' 
+				AND start_ts >= now() - INTERVAL 7 DAY
+				GROUP BY time ORDER BY time`, fingerprintEscaped)
+		}
 		
 		trendRows, _ := queryClient.Query(trendsQuery)
 		var trends []map[string]interface{}
@@ -3884,7 +4244,8 @@ func main() {
 			http.Error(w, "method not allowed", 405)
 			return
 		}
-		
+
+		ctx, _ := ExtractTenantContext(r, queryClient)
 		limit := r.URL.Query().Get("limit")
 		if limit == "" {
 			limit = "100" // Smaller batch size for infinite scroll
@@ -3893,12 +4254,23 @@ func main() {
 		if limitInt > 500 {
 			limitInt = 500 // Cap at 500 per request
 		}
-		
+
 		since := r.URL.Query().Get("since")
 		service := r.URL.Query().Get("service")
 		all := r.URL.Query().Get("all") // If "all" is set, fetch all historical dumps
 		cursor := r.URL.Query().Get("cursor") // Timestamp cursor for pagination
-		
+
+		// Build tenant filter - skip tenant filtering if "all" is selected
+		var tenantFilter string
+		if ctx.IsAllTenants() {
+			// No tenant filtering - show all data
+			tenantFilter = ""
+		} else {
+			// Handle NULL/empty tenant IDs by treating them as default tenant
+			tenantFilter = fmt.Sprintf("(coalesce(nullif(organization_id, ''), 'default-org') = '%s' AND coalesce(nullif(project_id, ''), 'default-project') = '%s')",
+				escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID))
+		}
+
 		// Query spans_full for spans with dumps
 		query := `SELECT 
 			trace_id,
@@ -3909,6 +4281,10 @@ func main() {
 			dumps
 		FROM opa.spans_full 
 		WHERE dumps != '' AND dumps != '[]' AND dumps != 'null'`
+		
+		if tenantFilter != "" {
+			query += " AND " + tenantFilter
+		}
 		
 		if service != "" {
 			query += fmt.Sprintf(" AND service = '%s'", strings.ReplaceAll(service, "'", "''"))
@@ -4067,7 +4443,8 @@ func main() {
 			http.Error(w, "method not allowed", 405)
 			return
 		}
-		
+
+		ctx, _ := ExtractTenantContext(r, queryClient)
 		limit := r.URL.Query().Get("limit")
 		if limit == "" {
 			limit = "100" // Smaller batch size for infinite scroll
@@ -4076,60 +4453,104 @@ func main() {
 		if limitInt > 500 {
 			limitInt = 500 // Cap at 500 per request
 		}
-		
+
 		since := r.URL.Query().Get("since")
 		service := r.URL.Query().Get("service")
 		level := r.URL.Query().Get("level")
 		all := r.URL.Query().Get("all") // If "all" is set, fetch all historical logs
 		cursor := r.URL.Query().Get("cursor") // Timestamp cursor for pagination
-		
+
+		// Build tenant filter - skip tenant filtering if "all" is selected
+		// Logs table doesn't have organization_id/project_id, so we join with spans_min
+		var tenantFilter string
+		var useJoin bool
+		if ctx.IsAllTenants() {
+			// No tenant filtering - show all data
+			tenantFilter = ""
+			useJoin = false
+		} else {
+			// Handle NULL/empty tenant IDs by treating them as default tenant
+			tenantFilter = fmt.Sprintf("(coalesce(nullif(spans_min.organization_id, ''), 'default-org') = '%s' AND coalesce(nullif(spans_min.project_id, ''), 'default-project') = '%s')",
+				escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID))
+			useJoin = true
+		}
+
 		// Query opa.logs table
-		query := `SELECT 
-			id,
-			trace_id,
-			span_id,
-			service,
-			level,
-			message,
-			toUnixTimestamp64Milli(timestamp) as timestamp_ms,
-			timestamp,
-			fields
-		FROM opa.logs 
-		WHERE 1=1`
+		var query string
+		if useJoin {
+			query = `SELECT 
+				logs.id,
+				logs.trace_id,
+				logs.span_id,
+				logs.service,
+				logs.level,
+				logs.message,
+				toUnixTimestamp64Milli(logs.timestamp) as timestamp_ms,
+				logs.timestamp,
+				logs.fields
+			FROM opa.logs as logs
+			INNER JOIN opa.spans_min as spans_min ON logs.trace_id = spans_min.trace_id
+			WHERE 1=1 AND ` + tenantFilter
+		} else {
+			query = `SELECT 
+				id,
+				trace_id,
+				span_id,
+				service,
+				level,
+				message,
+				toUnixTimestamp64Milli(timestamp) as timestamp_ms,
+				timestamp,
+				fields
+			FROM opa.logs 
+			WHERE 1=1`
+		}
+		
+		// Use table prefix when joining
+		serviceColumn := "service"
+		levelColumn := "level"
+		if useJoin {
+			serviceColumn = "logs.service"
+			levelColumn = "logs.level"
+		}
 		
 		if service != "" {
-			query += fmt.Sprintf(" AND service = '%s'", strings.ReplaceAll(service, "'", "''"))
+			query += fmt.Sprintf(" AND %s = '%s'", serviceColumn, strings.ReplaceAll(service, "'", "''"))
 		}
 		
 		if level != "" {
-			query += fmt.Sprintf(" AND level = '%s'", strings.ReplaceAll(level, "'", "''"))
+			query += fmt.Sprintf(" AND %s = '%s'", levelColumn, strings.ReplaceAll(level, "'", "''"))
 		}
 		
 		// Cursor-based pagination: if cursor is provided, fetch logs older than cursor
+		timestampColumn := "timestamp"
+		if useJoin {
+			timestampColumn = "logs.timestamp"
+		}
 		if cursor != "" {
 			// Parse cursor as timestamp (milliseconds since epoch)
 			if cursorInt, err := strconv.ParseInt(cursor, 10, 64); err == nil {
 				// Convert to ClickHouse datetime format
 				cursorTime := time.UnixMilli(cursorInt).Format("2006-01-02 15:04:05.000")
-				query += fmt.Sprintf(" AND timestamp < '%s'", cursorTime)
+				query += fmt.Sprintf(" AND %s < '%s'", timestampColumn, cursorTime)
 			}
 		} else {
 			// Only apply time restriction if "all" is not set and "since" is not provided
 			if all == "" {
 				if since != "" {
-					query += fmt.Sprintf(" AND timestamp >= '%s'", since)
+					query += fmt.Sprintf(" AND %s >= '%s'", timestampColumn, since)
 				} else {
 					// Default to last 7 days for better coverage while still being reasonable
-					query += " AND timestamp >= now() - INTERVAL 7 DAY"
+					query += fmt.Sprintf(" AND %s >= now() - INTERVAL 7 DAY", timestampColumn)
 				}
 			} else if since != "" {
 				// If "all" is set but "since" is also provided, use "since" as minimum
-				query += fmt.Sprintf(" AND timestamp >= '%s'", since)
+				query += fmt.Sprintf(" AND %s >= '%s'", timestampColumn, since)
 			}
 			// If "all" is set and no "since", no time restriction (fetch all historical)
 		}
 		
-		query += " ORDER BY timestamp DESC LIMIT " + strconv.Itoa(limitInt)
+		query += fmt.Sprintf(" ORDER BY %s DESC LIMIT %s", timestampColumn, strconv.Itoa(limitInt))
 		
 		rows, err := queryClient.Query(query)
 		if err != nil {
@@ -5941,7 +6362,7 @@ func handleLogMessage(raw json.RawMessage, writer *ClickHouseWriter, wsHub *WebS
 }
 
 // calculateSpanStatus determines the span status based on HTTP response codes and error indicators
-// This follows New Relic's approach: extension provides data, agent calculates status
+// Extension provides data, agent calculates status
 // Returns "error" for errors, "ok" for success, or empty string to keep original status
 func calculateSpanStatus(inc *Incoming) string {
 	// Check HTTP response status code from tags (highest priority - authoritative source)
@@ -6107,7 +6528,7 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 			}
 		}
 		
-		// Calculate status based on HTTP response code and error indicators (New Relic-style)
+		// Calculate status based on HTTP response code and error indicators
 		// Extension provides data, agent calculates status for better performance
 		calculatedStatus := calculateSpanStatus(&inc)
 		if calculatedStatus != "" {
@@ -6354,75 +6775,80 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 		hasProfilingData := hasSqlData || hasHttpData || hasCacheData || hasRedisData || hasProfilingDataInStack
 		
 		// Aggregate all SQL queries, HTTP requests, Redis operations, and cache operations
-		// This is needed both for full span storage and service map processing
-			var allSQLQueries []interface{}
+		// Each span comes separately with its own data, no need to aggregate from call stack
+		// However, for backward compatibility, we still check call stack if present (old format)
+		var allSQLQueries []interface{}
 		var allHttpRequests []interface{}
 		var allCacheOps []interface{}
 		var allRedisOps []interface{}
 			
-		// Aggregate SQL queries: from inc.Sql (direct field) and from call stack
-			if len(inc.Sql) > 0 {
-				var sqlArray []interface{}
-				if err := json.Unmarshal(inc.Sql, &sqlArray); err == nil {
-					allSQLQueries = append(allSQLQueries, sqlArray...)
-				}
+		// Aggregate SQL queries: from inc.Sql (direct field) - each span has its own SQL
+		if len(inc.Sql) > 0 {
+			var sqlArray []interface{}
+			if err := json.Unmarshal(inc.Sql, &sqlArray); err == nil {
+				allSQLQueries = append(allSQLQueries, sqlArray...)
 			}
-			if len(inc.Stack) > 0 {
-				callStack := parseCallStack(inc.Stack)
-				stackQueries := collectSQLQueriesFromCallStack(callStack)
-				if len(stackQueries) > 0 {
-					allSQLQueries = append(allSQLQueries, stackQueries...)
-				}
+		}
+		// Backward compatibility: also check call stack if present (old format with embedded stack)
+		if len(inc.Stack) > 0 {
+			callStack := parseCallStack(inc.Stack)
+			stackQueries := collectSQLQueriesFromCallStack(callStack)
+			if len(stackQueries) > 0 {
+				allSQLQueries = append(allSQLQueries, stackQueries...)
 			}
+		}
 			
-		// Aggregate HTTP requests: from direct field and from call stack
-			if len(inc.Http) > 0 {
-				var httpArray []interface{}
-				if err := json.Unmarshal(inc.Http, &httpArray); err == nil {
-					allHttpRequests = append(allHttpRequests, httpArray...)
+		// Aggregate HTTP requests: from direct field - each span has its own HTTP
+		if len(inc.Http) > 0 {
+			var httpArray []interface{}
+			if err := json.Unmarshal(inc.Http, &httpArray); err == nil {
+				allHttpRequests = append(allHttpRequests, httpArray...)
 				log.Printf("[DEBUG] Service map: found %d HTTP requests in inc.Http for service %s", len(httpArray), inc.Service)
-				}
 			}
-			if len(inc.Stack) > 0 {
-				callStack := parseCallStack(inc.Stack)
-				stackRequests := collectHttpRequestsFromCallStack(callStack)
-				if len(stackRequests) > 0 {
-					allHttpRequests = append(allHttpRequests, stackRequests...)
+		}
+		// Backward compatibility: also check call stack if present
+		if len(inc.Stack) > 0 {
+			callStack := parseCallStack(inc.Stack)
+			stackRequests := collectHttpRequestsFromCallStack(callStack)
+			if len(stackRequests) > 0 {
+				allHttpRequests = append(allHttpRequests, stackRequests...)
 				log.Printf("[DEBUG] Service map: found %d HTTP requests in call stack for service %s", len(stackRequests), inc.Service)
-				}
 			}
+		}
 			
-		// Aggregate cache operations: from direct field and from call stack
-			if len(inc.Cache) > 0 {
-				var cacheArray []interface{}
-				if err := json.Unmarshal(inc.Cache, &cacheArray); err == nil {
-					allCacheOps = append(allCacheOps, cacheArray...)
-				}
+		// Aggregate cache operations: from direct field - each span has its own cache
+		if len(inc.Cache) > 0 {
+			var cacheArray []interface{}
+			if err := json.Unmarshal(inc.Cache, &cacheArray); err == nil {
+				allCacheOps = append(allCacheOps, cacheArray...)
 			}
-			if len(inc.Stack) > 0 {
-				callStack := parseCallStack(inc.Stack)
-				stackCacheOps := collectCacheOperationsFromCallStack(callStack)
-				if len(stackCacheOps) > 0 {
-					allCacheOps = append(allCacheOps, stackCacheOps...)
-				}
+		}
+		// Backward compatibility: also check call stack if present
+		if len(inc.Stack) > 0 {
+			callStack := parseCallStack(inc.Stack)
+			stackCacheOps := collectCacheOperationsFromCallStack(callStack)
+			if len(stackCacheOps) > 0 {
+				allCacheOps = append(allCacheOps, stackCacheOps...)
 			}
+		}
 			
-		// Aggregate Redis operations: from direct field and from call stack
-			if len(inc.Redis) > 0 {
-				var redisArray []interface{}
-				if err := json.Unmarshal(inc.Redis, &redisArray); err == nil {
-					allRedisOps = append(allRedisOps, redisArray...)
+		// Aggregate Redis operations: from direct field - each span has its own Redis
+		if len(inc.Redis) > 0 {
+			var redisArray []interface{}
+			if err := json.Unmarshal(inc.Redis, &redisArray); err == nil {
+				allRedisOps = append(allRedisOps, redisArray...)
 				log.Printf("[DEBUG] Service map: found %d Redis operations in inc.Redis for service %s", len(redisArray), inc.Service)
-				}
 			}
-			if len(inc.Stack) > 0 {
-				callStack := parseCallStack(inc.Stack)
-				stackRedisOps := collectRedisOperationsFromCallStack(callStack)
-				if len(stackRedisOps) > 0 {
-					allRedisOps = append(allRedisOps, stackRedisOps...)
+		}
+		// Backward compatibility: also check call stack if present
+		if len(inc.Stack) > 0 {
+			callStack := parseCallStack(inc.Stack)
+			stackRedisOps := collectRedisOperationsFromCallStack(callStack)
+			if len(stackRedisOps) > 0 {
+				allRedisOps = append(allRedisOps, stackRedisOps...)
 				log.Printf("[DEBUG] Service map: found %d Redis operations in call stack for service %s", len(stackRedisOps), inc.Service)
-				}
 			}
+		}
 		
 		// Store full span if: trace should be kept, chunk is done, call stack present, dumps present, any profiling data present, OR always (to capture events even with empty call stack)
 		// Always storing ensures we capture all profiling data regardless of call stack state
@@ -6666,4 +7092,3 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 		}
 	}
 }
-
