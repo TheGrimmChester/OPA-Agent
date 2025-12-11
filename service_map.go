@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -63,8 +64,13 @@ func (smp *ServiceMapProcessor) SetURL(url string) {
 
 // Process span to extract service dependencies
 func (smp *ServiceMapProcessor) ProcessSpan(span *Span, parentSpan *Span) {
+	// Process external dependencies (HTTP, Redis, SQL, Cache) for all spans, including root spans
+	// This allows tracking external dependencies even when there's no parent service
+	smp.ProcessExternalDependencies(span)
+	
+	// Service-to-service dependencies only make sense when there's a parent span
 	if parentSpan == nil {
-		return // Root span, no dependency
+		return // Root span, no service-to-service dependency
 	}
 
 	fromService := parentSpan.Service
@@ -103,9 +109,6 @@ func (smp *ServiceMapProcessor) ProcessSpan(span *Span, parentSpan *Span) {
 			dep.BytesReceived += int64(recv)
 		}
 	}
-
-	// Also process external dependencies from this span
-	smp.ProcessExternalDependencies(span)
 }
 
 // ProcessExternalDependencies extracts external dependencies (DB, HTTP, Redis, Cache) from a span
@@ -129,7 +132,32 @@ func (smp *ServiceMapProcessor) ProcessExternalDependencies(span *Span) {
 				}
 				
 				if dbSystem != "" {
-					target := fmt.Sprintf("db:%s", dbSystem)
+					// Try to extract hostname if available
+					dbHost := ""
+					if host, ok := sqlMap["db_host"].(string); ok && host != "" {
+						dbHost = host
+					} else if host, ok := sqlMap["host"].(string); ok && host != "" {
+						dbHost = host
+					} else if host, ok := sqlMap["server"].(string); ok && host != "" {
+						dbHost = host
+					}
+					
+					// Try to get DSN (preferred if available, as it contains full connection info)
+					dbDsn := ""
+					if dsn, ok := sqlMap["db_dsn"].(string); ok && dsn != "" {
+						dbDsn = dsn
+					}
+					
+					// Format target: prefer DSN (without password), then hostname, then just db system
+					target := ""
+					if dbDsn != "" {
+						// Use DSN as target (already has password masked)
+						target = dbDsn
+					} else if dbHost != "" {
+						target = fmt.Sprintf("%s://%s", dbSystem, dbHost)
+					} else {
+						target = fmt.Sprintf("db:%s", dbSystem)
+					}
 					key := fmt.Sprintf("%s->database->%s", span.Service, target)
 					
 					dep, exists := smp.externalDeps[key]
@@ -173,7 +201,12 @@ func (smp *ServiceMapProcessor) ProcessExternalDependencies(span *Span) {
 					url = fmt.Sprintf("%s://%s", scheme, host)
 				}
 				
-				if url != "" && !strings.Contains(url, span.Service) {
+				if url != "" {
+					// Check if URL contains service name (skip if it does - internal call)
+					if strings.Contains(url, span.Service) {
+						continue
+					}
+					
 					key := fmt.Sprintf("%s->http->%s", span.Service, url)
 					
 					dep, exists := smp.externalDeps[key]
@@ -201,6 +234,8 @@ func (smp *ServiceMapProcessor) ProcessExternalDependencies(span *Span) {
 					if recv, ok := httpMap["bytes_received"].(float64); ok {
 						dep.BytesReceived += int64(recv)
 					}
+				} else {
+					log.Printf("[DEBUG] ServiceMap: HTTP item has no URL field: %+v", httpMap)
 				}
 			}
 		}
@@ -384,6 +419,19 @@ func (smp *ServiceMapProcessor) Flush() {
 				"target": extDep.DependencyTarget,
 			})
 		} else {
+			if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+				bodyBytes := make([]byte, 1024)
+				n, _ := resp.Body.Read(bodyBytes)
+				bodyStr := string(bodyBytes[:n])
+				resp.Body.Close()
+				LogError(fmt.Errorf("failed to insert external dependency"), "ServiceMap flush error", map[string]interface{}{
+					"status_code": resp.StatusCode,
+					"from_service": extDep.FromService,
+					"target": extDep.DependencyTarget,
+					"type": extDep.DependencyType,
+					"response": bodyStr,
+				})
+			}
 			resp.Body.Close()
 		}
 	}
