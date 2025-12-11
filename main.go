@@ -823,6 +823,7 @@ func reconstructTrace(spans []*Span) *Trace {
 	// Expand call stack nodes into child spans for the root span (if expand_spans flag is true)
 	// This converts significant call stack nodes (SQL, HTTP, cache, Redis, or long calls) into separate child spans
 	// for better trace visualization. If expand_spans is false, the original single-span behavior is preserved.
+	// NOTE: Expansion only works when the call stack is present. If the call stack is empty, there's nothing to expand.
 	if root != nil && len(root.Stack) > 0 {
 		// Check expand_spans flag from root span's tags (defaults to true for backward compatibility)
 		shouldExpand := extractExpandSpansFlag(root)
@@ -1285,10 +1286,26 @@ func main() {
 		}
 		
 		// Build final aggregation query
-		query := "SELECT trace_id, service, min(start_ts) as start_ts, max(end_ts) as end_ts, "
-		query += "sum(duration_ms) as duration_ms, count(*) as span_count, "
-		query += "any(status) as status, any(language) as language, any(language_version) as language_version, "
-		query += "any(framework) as framework, any(framework_version) as framework_version FROM (" + baseQuery + ") GROUP BY trace_id, service"
+		// For span_count, we need to calculate expanded spans from call stack
+		// Join with spans_full to get call stack data and calculate expanded count
+		// Note: baseQuery must include span_id for the JOIN to work
+		query := "SELECT sm.trace_id, sm.service, min(sm.start_ts) as start_ts, max(sm.end_ts) as end_ts, "
+		query += "sum(sm.duration_ms) as duration_ms, "
+		// Calculate expanded span count: 1 (root) + significant call stack nodes
+		// We approximate by counting all stack nodes (will be filtered to significant ones during expansion)
+		// This gives a reasonable estimate without complex JSON parsing
+		// Use any() aggregate function since we're grouping
+		query += "CASE "
+		query += "  WHEN any(sf.stack) IS NULL OR any(sf.stack) = '[]' OR any(sf.stack) = '' THEN 1 "
+		query += "  WHEN JSONExtractString(any(sf.tags), '$.expand_spans') = 'false' THEN 1 "
+		query += "  ELSE 1 + toInt32(JSONLength(any(sf.stack))) "
+		query += "END as span_count, "
+		query += "any(sm.status) as status, any(sm.language) as language, any(sm.language_version) as language_version, "
+		query += "any(sm.framework) as framework, any(sm.framework_version) as framework_version "
+		query += "FROM (" + baseQuery + ") sm "
+		// Join on trace_id only - there's only one root span per trace in spans_min
+		query += "LEFT JOIN (SELECT DISTINCT trace_id, stack, tags FROM opa.spans_full) sf ON sm.trace_id = sf.trace_id "
+		query += "GROUP BY sm.trace_id, sm.service"
 		
 		// Apply duration filters after grouping
 		if minDuration != "" {
