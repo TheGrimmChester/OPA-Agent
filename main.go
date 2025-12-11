@@ -764,6 +764,34 @@ func expandCallStackToSpans(rootSpan *Span) []*Span {
 	return allSpans
 }
 
+// extractExpandSpansFlag extracts the expand_spans flag from span tags
+// Returns true if expand_spans is true or not present (default to multiple spans mode)
+// Returns false if expand_spans is explicitly set to false
+// 
+// Backward compatibility: Old spans without this flag will default to multiple spans mode (new behavior)
+// This ensures existing traces work correctly while new traces get the improved visualization
+func extractExpandSpansFlag(span *Span) bool {
+	if span == nil || span.Tags == nil {
+		return true // Default to multiple spans mode
+	}
+	
+	if expandSpansVal, ok := span.Tags["expand_spans"]; ok {
+		// Handle different types that might come from JSON
+		switch v := expandSpansVal.(type) {
+		case bool:
+			return v
+		case string:
+			return v == "true" || v == "1"
+		case float64:
+			return v != 0
+		case int:
+			return v != 0
+		}
+	}
+	
+	return true // Default to multiple spans mode if flag not present
+}
+
 func reconstructTrace(spans []*Span) *Trace {
 	if len(spans) == 0 {
 		return nil
@@ -792,29 +820,37 @@ func reconstructTrace(spans []*Span) *Trace {
 		}
 	}
 	
-	// Expand call stack nodes into child spans for the root span
+	// Expand call stack nodes into child spans for the root span (if expand_spans flag is true)
+	// This converts significant call stack nodes (SQL, HTTP, cache, Redis, or long calls) into separate child spans
+	// for better trace visualization. If expand_spans is false, the original single-span behavior is preserved.
 	if root != nil && len(root.Stack) > 0 {
-		expandedSpans := expandCallStackToSpans(root)
-		// Update the spans list with expanded spans
-		spans = expandedSpans
+		// Check expand_spans flag from root span's tags (defaults to true for backward compatibility)
+		shouldExpand := extractExpandSpansFlag(root)
 		
-		// Rebuild span map and tree with expanded spans
-		spanMap = make(map[string]*Span)
-		for _, span := range spans {
-			spanMap[span.SpanID] = span
-		}
-		
-		// Rebuild tree with expanded spans
-		root = nil
-		for _, span := range spans {
-			if span.ParentID == nil {
-				root = span
-			} else {
-				if parent, ok := spanMap[*span.ParentID]; ok {
-					parent.Children = append(parent.Children, span)
+		if shouldExpand {
+			expandedSpans := expandCallStackToSpans(root)
+			// Update the spans list with expanded spans
+			spans = expandedSpans
+			
+			// Rebuild span map and tree with expanded spans
+			spanMap = make(map[string]*Span)
+			for _, span := range spans {
+				spanMap[span.SpanID] = span
+			}
+			
+			// Rebuild tree with expanded spans
+			root = nil
+			for _, span := range spans {
+				if span.ParentID == nil {
+					root = span
+				} else {
+					if parent, ok := spanMap[*span.ParentID]; ok {
+						parent.Children = append(parent.Children, span)
+					}
 				}
 			}
 		}
+		// If shouldExpand is false, keep original behavior: single span with call stack nested inside
 	}
 	
 	return &Trace{
