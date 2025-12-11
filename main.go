@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -39,7 +40,140 @@ var (
 )
 
 
+// normalizeSQLQuery creates a fingerprint by normalizing SQL queries
+// It replaces literals with placeholders to group similar queries together
+func normalizeSQLQuery(query string) string {
+	if query == "" {
+		return ""
+	}
+	
+	// Trim and normalize whitespace
+	query = strings.TrimSpace(query)
+	query = strings.ReplaceAll(query, "\n", " ")
+	query = strings.ReplaceAll(query, "\t", " ")
+	// Collapse multiple spaces
+	for strings.Contains(query, "  ") {
+		query = strings.ReplaceAll(query, "  ", " ")
+	}
+	
+	// Replace string literals (single and double quotes) first
+	query = replaceStringLiterals(query)
+	
+	// Replace numeric literals
+	query = replaceNumericLiterals(query)
+	
+	// Normalize common patterns
+	query = normalizeSQLPatterns(query)
+	
+	// Final whitespace cleanup
+	query = strings.TrimSpace(query)
+	
+	return query
+}
+
 // Extract language metadata from tags or use defaults
+
+// replaceStringLiterals replaces string literals with ?
+// Handles SQL string literals with proper escaping:
+// - Single quotes: 'text' or 'text''s' (escaped quote - two single quotes)
+// - Double quotes: "text" or "text""s" (escaped quote in some dialects)
+func replaceStringLiterals(query string) string {
+	var result strings.Builder
+	inSingleQuote := false
+	inDoubleQuote := false
+	
+	runes := []rune(query)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		
+		// Handle single quotes (SQL string literals)
+		if r == '\'' && !inDoubleQuote {
+			if inSingleQuote {
+				// Check for escaped quote: '' (two single quotes in SQL)
+				// This is the standard SQL way to escape a single quote
+				if i+1 < len(runes) && runes[i+1] == '\'' {
+					// This is an escaped quote inside the string, skip both quotes
+					i++ // Skip the next quote as well
+					continue
+				}
+				// End of string literal
+				inSingleQuote = false
+				result.WriteString("?")
+			} else {
+				// Start of string literal
+				inSingleQuote = true
+			}
+		} else if r == '"' && !inSingleQuote {
+			// Handle double quotes (identifier quotes in some SQL dialects, or string literals)
+			if inDoubleQuote {
+				// Check for escaped quote: "" (two double quotes)
+				if i+1 < len(runes) && runes[i+1] == '"' {
+					// This is an escaped quote inside the string, skip both quotes
+					i++ // Skip the next quote as well
+					continue
+				}
+				// End of string literal
+				inDoubleQuote = false
+				result.WriteString("?")
+			} else {
+				// Start of string literal
+				inDoubleQuote = true
+			}
+		} else if inSingleQuote || inDoubleQuote {
+			// Inside string literal, skip the character (it's part of the literal value)
+			continue
+		} else {
+			// Outside string literal, keep the character
+			result.WriteRune(r)
+		}
+	}
+	
+	// If we ended inside a quote (malformed query), still write the ? to close it
+	if inSingleQuote || inDoubleQuote {
+		result.WriteString("?")
+	}
+	
+	return result.String()
+}
+
+// replaceNumericLiterals replaces numeric literals with ?
+func replaceNumericLiterals(query string) string {
+	// Use regexp to match numeric literals
+	// Match: optional sign, digits, optional decimal point and more digits
+	// But be careful not to match numbers that are part of identifiers
+	re := regexp.MustCompile(`\b[+-]?\d+\.?\d*\b`)
+	return re.ReplaceAllString(query, "?")
+}
+
+// normalizeSQLPatterns normalizes common SQL patterns
+// Note: Numeric literals are already replaced by replaceNumericLiterals, so LIMIT/OFFSET are already normalized
+func normalizeSQLPatterns(query string) string {
+	// Normalize IN clauses: IN (?, ?, ?) -> IN (?)
+	// This groups queries with different numbers of IN values
+	// Match: IN ( followed by zero or more ? or commas/spaces, then )
+	re := regexp.MustCompile(`(?i)\bIN\s*\([?,\s]*\)`)
+	query = re.ReplaceAllString(query, "IN (?)")
+	
+	// Normalize VALUES clauses: VALUES (?, ?, ?) -> VALUES (?)
+	// This groups INSERT statements with different numbers of values
+	// Handle single VALUES clause
+	re = regexp.MustCompile(`(?i)\bVALUES\s*\([?,\s]*\)`)
+	query = re.ReplaceAllString(query, "VALUES (?)")
+	
+	// Handle multiple VALUES clauses: VALUES (?, ?), (?, ?) -> VALUES (?)
+	// Replace all multiple value groups with a single normalized one
+	re = regexp.MustCompile(`(?i)\bVALUES\s*(\([?,\s]*\)\s*,?\s*)+`)
+	query = re.ReplaceAllString(query, "VALUES (?)")
+	
+	// Normalize whitespace around operators and keywords (but preserve single spaces)
+	query = regexp.MustCompile(`\s+`).ReplaceAllString(query, " ")
+	query = regexp.MustCompile(`\s*\(\s*`).ReplaceAllString(query, " (")
+	query = regexp.MustCompile(`\s*\)\s*`).ReplaceAllString(query, ") ")
+	query = regexp.MustCompile(`\s*,\s*`).ReplaceAllString(query, ", ")
+	
+	return query
+}
+
 func extractLanguageMetadata(inc *Incoming) (language, langVersion, framework, frameworkVersion string) {
 	// Default to PHP for backward compatibility
 	language = "php"
@@ -513,6 +647,123 @@ func collectRedisOperationsFromCallStack(nodes []*CallNode) []interface{} {
 	return allOps
 }
 
+// expandCallStackToSpans converts significant call stack nodes into child spans
+// This creates multiple spans per trace instead of just one span with a call stack
+func expandCallStackToSpans(rootSpan *Span) []*Span {
+	if rootSpan == nil || len(rootSpan.Stack) == 0 {
+		return []*Span{rootSpan}
+	}
+	
+	var allSpans []*Span
+	allSpans = append(allSpans, rootSpan)
+	
+	// Recursively convert call nodes to spans
+	var convertNodeToSpan func(node *CallNode, parentSpanID string, baseStartTS int64) *Span
+	convertNodeToSpan = func(node *CallNode, parentSpanID string, baseStartTS int64) *Span {
+		// Only create a span for nodes that have significant operations or are important
+		hasSignificantData := len(node.SQLQueries) > 0 || 
+			len(node.HttpRequests) > 0 || 
+			len(node.CacheOperations) > 0 || 
+			len(node.RedisOperations) > 0 ||
+			node.DurationMs > 10.0 // Only create spans for calls longer than 10ms
+		
+		if !hasSignificantData {
+			return nil
+		}
+		
+		// Create a new span from this call node
+		spanID := node.CallID
+		if spanID == "" {
+			spanID = fmt.Sprintf("%s-%d", rootSpan.SpanID, len(allSpans))
+		}
+		
+		parentID := parentSpanID
+		if node.ParentID != "" {
+			// Try to find the parent span by call_id
+			for _, s := range allSpans {
+				if s.SpanID == node.ParentID {
+					parentID = s.SpanID
+					break
+				}
+			}
+		}
+		
+		// Calculate timestamps relative to root span
+		// Since call nodes don't have absolute timestamps, we approximate based on depth and order
+		// Start time is approximate: root start + some offset based on depth
+		startTS := rootSpan.StartTS + int64(float64(node.Depth)*1000) // Approximate offset by depth
+		endTS := startTS + int64(node.DurationMs*1000)
+		
+		// Build span name
+		spanName := node.Function
+		if node.Class != "" {
+			spanName = node.Class + "::" + node.Function
+		}
+		if spanName == "" {
+			spanName = "function_call"
+		}
+		
+		childSpan := &Span{
+			TraceID:  rootSpan.TraceID,
+			SpanID:   spanID,
+			ParentID: &parentID,
+			Service:  rootSpan.Service,
+			Name:     spanName,
+			StartTS:  startTS,
+			EndTS:    endTS,
+			Duration: node.DurationMs,
+			CPUms:    node.CPUMs,
+			Status:   rootSpan.Status,
+			Sql:      node.SQLQueries,
+			Http:     node.HttpRequests,
+			Cache:    node.CacheOperations,
+			Redis:    node.RedisOperations,
+			Language: rootSpan.Language,
+			LanguageVersion: rootSpan.LanguageVersion,
+			Framework: rootSpan.Framework,
+			FrameworkVersion: rootSpan.FrameworkVersion,
+		}
+		
+		// Add network data if present
+		if node.NetworkBytesSent > 0 || node.NetworkBytesReceived > 0 {
+			childSpan.Net = map[string]interface{}{
+				"bytes_sent":     node.NetworkBytesSent,
+				"bytes_received": node.NetworkBytesReceived,
+			}
+		}
+		
+		// Add tags with call information
+		childSpan.Tags = map[string]interface{}{
+			"call_id": node.CallID,
+			"file":    node.File,
+			"line":    node.Line,
+			"depth":   node.Depth,
+		}
+		
+		allSpans = append(allSpans, childSpan)
+		
+		// Recursively process children
+		for _, childNode := range node.Children {
+			childSpanNode := convertNodeToSpan(childNode, spanID, baseStartTS)
+			if childSpanNode != nil {
+				childSpan.Children = append(childSpan.Children, childSpanNode)
+			}
+		}
+		
+		return childSpan
+	}
+	
+	// Process all root-level call nodes
+	for _, rootNode := range rootSpan.Stack {
+		childSpan := convertNodeToSpan(rootNode, rootSpan.SpanID, rootSpan.StartTS)
+		if childSpan != nil {
+			rootSpan.Children = append(rootSpan.Children, childSpan)
+		}
+	}
+	
+	return allSpans
+}
+
 func reconstructTrace(spans []*Span) *Trace {
 	if len(spans) == 0 {
 		return nil
@@ -537,6 +788,31 @@ func reconstructTrace(spans []*Span) *Trace {
 		} else {
 			if parent, ok := spanMap[*span.ParentID]; ok {
 				parent.Children = append(parent.Children, span)
+			}
+		}
+	}
+	
+	// Expand call stack nodes into child spans for the root span
+	if root != nil && len(root.Stack) > 0 {
+		expandedSpans := expandCallStackToSpans(root)
+		// Update the spans list with expanded spans
+		spans = expandedSpans
+		
+		// Rebuild span map and tree with expanded spans
+		spanMap = make(map[string]*Span)
+		for _, span := range spans {
+			spanMap[span.SpanID] = span
+		}
+		
+		// Rebuild tree with expanded spans
+		root = nil
+		for _, span := range spans {
+			if span.ParentID == nil {
+				root = span
+			} else {
+				if parent, ok := spanMap[*span.ParentID]; ok {
+					parent.Children = append(parent.Children, span)
+				}
 			}
 		}
 	}
@@ -1779,6 +2055,7 @@ func main() {
 		services := make(map[string]bool)
 
 		// Get enhanced metrics from service_dependencies table with P95/P99 and throughput
+		// Calculate throughput using a subquery to avoid nested aggregate function error
 		enhancedQuery := fmt.Sprintf(`SELECT 
 			from_service,
 			to_service,
@@ -1789,7 +2066,7 @@ func main() {
 			quantile(0.95)(avg_duration_ms) as p95_latency_ms,
 			quantile(0.99)(avg_duration_ms) as p99_latency_ms,
 			avg(error_rate) as error_rate,
-			sum(call_count) / (dateDiff('second', min(hour), max(hour)) + 1) as throughput,
+			toFloat64(sum(call_count)) / greatest(toFloat64(dateDiff('second', %s, %s)), 1.0) as throughput,
 			sum(bytes_sent) as bytes_sent,
 			sum(bytes_received) as bytes_received
 			FROM opa.service_dependencies
@@ -1797,7 +2074,7 @@ func main() {
 				AND hour >= %s AND hour <= %s
 			GROUP BY from_service, to_service, dependency_type, dependency_target
 			ORDER BY from_service, to_service, dependency_type`,
-			escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID), timeFrom, timeTo)
+			timeFrom, timeTo, escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID), timeFrom, timeTo)
 
 		enhancedRows, enhancedErr := queryClient.Query(enhancedQuery)
 		externalDeps := make(map[string]bool) // Track external dependency nodes
@@ -1820,7 +2097,11 @@ func main() {
 					if dependencyTarget != "" {
 						toService = dependencyTarget
 					}
-					externalDeps[toService] = true
+					// Always add external dependency to the map, even if toService is empty
+					// This ensures external dependencies are tracked
+					if toService != "" {
+						externalDeps[toService] = true
+					}
 				} else {
 					services[toService] = true
 				}
@@ -2074,6 +2355,126 @@ func main() {
 						"throughput":      throughput,
 						"bytes_sent":      bytesSent,
 						"bytes_received":  bytesReceived,
+						"health_status":   healthStatus,
+						"dependency_type": "http",
+						"dependency_target": target,
+					})
+				}
+
+				// Also check spans_full for HTTP requests stored in http field (cURL requests)
+				// This handles cases where HTTP requests are in the JSON field but not extracted to url_host/url_scheme
+				httpFullQuery := fmt.Sprintf(`SELECT 
+					service,
+					http,
+					start_ts,
+					duration_ms,
+					status
+					FROM opa.spans_full
+					WHERE organization_id = '%s' AND project_id = '%s'
+						AND http != '' AND http != '[]' AND http != 'null'
+						AND start_ts >= %s AND start_ts <= %s
+					LIMIT 1000`,
+					escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID), timeFrom, timeTo)
+
+				httpFullRows, _ := queryClient.Query(httpFullQuery)
+				httpCallsMap := make(map[string]map[string]interface{}) // key: "service->url"
+
+				for _, row := range httpFullRows {
+					fromService := getString(row, "service")
+					httpData := getString(row, "http")
+					if fromService == "" || httpData == "" {
+						continue
+					}
+
+					// Parse HTTP requests JSON array
+					var httpRequests []map[string]interface{}
+					if err := json.Unmarshal([]byte(httpData), &httpRequests); err != nil {
+						continue
+					}
+
+					for _, req := range httpRequests {
+						url := ""
+						if u, ok := req["url"].(string); ok && u != "" {
+							url = u
+						} else if u, ok := req["URL"].(string); ok && u != "" {
+							url = u
+						} else if host, ok := req["host"].(string); ok && host != "" {
+							scheme := "http"
+							if s, ok := req["scheme"].(string); ok && s != "" {
+								scheme = s
+							}
+							url = fmt.Sprintf("%s://%s", scheme, host)
+						}
+
+						if url == "" {
+							continue
+						}
+
+						// Skip internal calls
+						if strings.Contains(url, fromService) {
+							continue
+						}
+
+						key := fmt.Sprintf("%s->%s", fromService, url)
+						call, exists := httpCallsMap[key]
+						if !exists {
+							call = map[string]interface{}{
+								"from_service": fromService,
+								"target":       url,
+								"call_count":   int64(0),
+								"total_duration": 0.0,
+								"error_count":  int64(0),
+								"total_bytes_sent": int64(0),
+								"total_bytes_received": int64(0),
+							}
+							httpCallsMap[key] = call
+						}
+
+						call["call_count"] = call["call_count"].(int64) + 1
+						if duration, ok := req["duration_ms"].(float64); ok {
+							call["total_duration"] = call["total_duration"].(float64) + duration
+						} else if duration, ok := req["duration"].(float64); ok {
+							call["total_duration"] = call["total_duration"].(float64) + duration*1000
+						}
+						if status, ok := req["status"].(string); ok && (status == "error" || status == "0") {
+							call["error_count"] = call["error_count"].(int64) + 1
+						}
+						if sent, ok := req["bytes_sent"].(float64); ok {
+							call["total_bytes_sent"] = call["total_bytes_sent"].(int64) + int64(sent)
+						}
+						if recv, ok := req["bytes_received"].(float64); ok {
+							call["total_bytes_received"] = call["total_bytes_received"].(int64) + int64(recv)
+						}
+					}
+				}
+
+				// Convert aggregated HTTP calls to edges
+				for _, call := range httpCallsMap {
+					fromService := call["from_service"].(string)
+					target := call["target"].(string)
+					callCount := call["call_count"].(int64)
+					if callCount == 0 {
+						continue
+					}
+
+					services[fromService] = true
+					externalDeps[target] = true
+
+					avgLatency := call["total_duration"].(float64) / float64(callCount)
+					errorRate := float64(call["error_count"].(int64)) / float64(callCount) * 100.0
+					healthStatus := calculateHealthStatus(errorRate, avgLatency)
+
+					edges = append(edges, map[string]interface{}{
+						"from":            fromService,
+						"to":              target,
+						"avg_latency_ms":  avgLatency,
+						"p95_latency_ms":  avgLatency, // Approximate
+						"p99_latency_ms":  avgLatency, // Approximate
+						"error_rate":      errorRate,
+						"call_count":      callCount,
+						"throughput":      0.0, // Not calculated for this fallback
+						"bytes_sent":      call["total_bytes_sent"],
+						"bytes_received":  call["total_bytes_received"],
 						"health_status":   healthStatus,
 						"dependency_type": "http",
 						"dependency_target": target,
@@ -2583,6 +2984,206 @@ func main() {
 				"p95_duration":  getFloat64(row, "p95_duration"),
 				"p99_duration":  getFloat64(row, "p99_duration"),
 				"top_endpoints": endpoints,
+			})
+			return
+		}
+		
+		// Get HTTP/cURL calls for this service
+		if len(parts) >= 5 && parts[4] == "http-calls" {
+			ctx, _ := ExtractTenantContext(r, queryClient)
+			timeFrom := r.URL.Query().Get("from")
+			timeTo := r.URL.Query().Get("to")
+			limit := r.URL.Query().Get("limit")
+			if limit == "" {
+				limit = "100"
+			}
+			limitInt, _ := strconv.Atoi(limit)
+			if limitInt > 500 {
+				limitInt = 500
+			}
+			
+			// Query spans_full to get HTTP requests
+			var query string
+			if ctx.IsAllTenants() {
+				query = fmt.Sprintf(`SELECT 
+					http,
+					start_ts,
+					duration_ms,
+					status,
+					trace_id,
+					span_id
+					FROM opa.spans_full 
+					WHERE service = '%s' AND http != '' AND http != '[]' AND http != 'null'`,
+					escapeSQL(service))
+			} else {
+				query = fmt.Sprintf(`SELECT 
+					http,
+					start_ts,
+					duration_ms,
+					status,
+					trace_id,
+					span_id
+					FROM opa.spans_full 
+					WHERE (coalesce(nullif(organization_id, ''), 'default-org') = '%s' AND coalesce(nullif(project_id, ''), 'default-project') = '%s') 
+						AND service = '%s' AND http != '' AND http != '[]' AND http != 'null'`,
+					escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID), escapeSQL(service))
+			}
+			
+			if timeFrom != "" {
+				query += fmt.Sprintf(" AND start_ts >= '%s'", escapeSQL(timeFrom))
+			} else {
+				query += " AND start_ts >= now() - INTERVAL 24 HOUR"
+			}
+			if timeTo != "" {
+				query += fmt.Sprintf(" AND start_ts <= '%s'", escapeSQL(timeTo))
+			}
+			query += fmt.Sprintf(" ORDER BY start_ts DESC LIMIT %d", limitInt)
+			
+			rows, err := queryClient.Query(query)
+			if err != nil {
+				LogError(err, "Failed to fetch HTTP calls for service", map[string]interface{}{
+					"service": service,
+				})
+				http.Error(w, "failed to fetch HTTP calls", 500)
+				return
+			}
+			
+			// Aggregate HTTP calls by URL
+			type HttpCallStats struct {
+				URL              string
+				Method           string
+				CallCount        int64
+				TotalDuration    float64
+				ErrorCount       int64
+				TotalBytesSent   int64
+				TotalBytesRecv   int64
+				MinDuration      float64
+				MaxDuration      float64
+			}
+			httpCallsMap := make(map[string]*HttpCallStats)
+			totalCalls := int64(0)
+			
+			for _, row := range rows {
+				httpData := getString(row, "http")
+				if httpData == "" {
+					continue
+				}
+				
+				// Parse HTTP requests JSON array
+				var httpRequests []map[string]interface{}
+				if err := json.Unmarshal([]byte(httpData), &httpRequests); err != nil {
+					continue
+				}
+				
+				for _, req := range httpRequests {
+					url := ""
+					if u, ok := req["url"].(string); ok && u != "" {
+						url = u
+					} else if u, ok := req["URL"].(string); ok && u != "" {
+						url = u
+					}
+					if url == "" {
+						continue
+					}
+					
+					method := "GET"
+					if m, ok := req["method"].(string); ok && m != "" {
+						method = m
+					}
+					
+					key := fmt.Sprintf("%s %s", method, url)
+					
+					call, exists := httpCallsMap[key]
+					if !exists {
+						call = &HttpCallStats{
+							URL:           url,
+							Method:        method,
+							MinDuration:   999999.0,
+							MaxDuration:   0.0,
+						}
+						httpCallsMap[key] = call
+					}
+					
+					call.CallCount++
+					totalCalls++
+					
+					var duration float64
+					if d, ok := req["duration_ms"].(float64); ok {
+						duration = d
+					} else if d, ok := req["duration"].(float64); ok {
+						duration = d * 1000.0
+					}
+					
+					if duration > 0 {
+						call.TotalDuration += duration
+						if duration < call.MinDuration {
+							call.MinDuration = duration
+						}
+						if duration > call.MaxDuration {
+							call.MaxDuration = duration
+						}
+					}
+					
+					statusCode := 0
+					if sc, ok := req["status_code"].(float64); ok {
+						statusCode = int(sc)
+					} else if sc, ok := req["statusCode"].(float64); ok {
+						statusCode = int(sc)
+					}
+					
+					if statusCode >= 400 {
+						call.ErrorCount++
+					} else if err, ok := req["error"].(string); ok && err != "" {
+						call.ErrorCount++
+					}
+					
+					if sent, ok := req["bytes_sent"].(float64); ok {
+						call.TotalBytesSent += int64(sent)
+					}
+					if recv, ok := req["bytes_received"].(float64); ok {
+						call.TotalBytesRecv += int64(recv)
+					}
+				}
+			}
+			
+			// Convert to array and calculate averages
+			httpCalls := make([]map[string]interface{}, 0, len(httpCallsMap))
+			for _, call := range httpCallsMap {
+				avgDuration := 0.0
+				errorRate := 0.0
+				if call.CallCount > 0 {
+					avgDuration = call.TotalDuration / float64(call.CallCount)
+					errorRate = float64(call.ErrorCount) / float64(call.CallCount) * 100.0
+					if call.MinDuration == 999999.0 {
+						call.MinDuration = 0.0
+					}
+				}
+				
+				httpCalls = append(httpCalls, map[string]interface{}{
+					"url":                call.URL,
+					"method":            call.Method,
+					"call_count":        call.CallCount,
+					"avg_duration":     avgDuration,
+					"min_duration":     call.MinDuration,
+					"max_duration":     call.MaxDuration,
+					"error_count":      call.ErrorCount,
+					"error_rate":       errorRate,
+					"total_bytes_sent": call.TotalBytesSent,
+					"total_bytes_received": call.TotalBytesRecv,
+				})
+			}
+			
+			// Sort by call count descending
+			sort.Slice(httpCalls, func(i, j int) bool {
+				ci, _ := httpCalls[i]["call_count"].(int64)
+				cj, _ := httpCalls[j]["call_count"].(int64)
+				return ci > cj
+			})
+			
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"service":     service,
+				"total_calls": totalCalls,
+				"http_calls":  httpCalls,
 			})
 			return
 		}
@@ -3147,28 +3748,46 @@ func main() {
 			limit = "100"
 		}
 		
-		// Group errors by service and name
+		// Query error_instances and join with spans_min to get service, then aggregate
+		// This gives us service information which is not in error_groups
 		query := `SELECT 
-			service,
-			name,
+			ei.error_type,
+			ei.error_message,
+			COALESCE(sm.service, 'unknown') as service,
 			count(*) as count,
-			min(start_ts) as first_seen,
-			max(start_ts) as last_seen
-			FROM opa.spans_min WHERE (status = 'error' OR status = '0')`
+			min(ei.occurred_at) as first_seen,
+			max(ei.occurred_at) as last_seen
+			FROM opa.error_instances ei
+			LEFT JOIN opa.spans_min sm ON ei.trace_id = sm.trace_id AND sm.trace_id != ''
+			WHERE 1=1`
 		
-		if service != "" {
-			query += fmt.Sprintf(" AND service = '%s'", strings.ReplaceAll(service, "'", "''"))
+		if service != "" && service != "unknown" {
+			query += fmt.Sprintf(" AND sm.service = '%s'", strings.ReplaceAll(service, "'", "''"))
 		}
 		if timeFrom != "" {
-			query += fmt.Sprintf(" AND start_ts >= '%s'", timeFrom)
+			// Convert ISO format to ClickHouse DateTime format
+			timeFromFormatted := strings.ReplaceAll(timeFrom, "T", " ")
+			timeFromFormatted = strings.ReplaceAll(timeFromFormatted, "Z", "")
+			if len(timeFromFormatted) > 19 {
+				timeFromFormatted = timeFromFormatted[:19]
+			}
+			query += fmt.Sprintf(" AND ei.occurred_at >= '%s'", timeFromFormatted)
 		} else {
-			query += " AND start_ts >= now() - INTERVAL 24 HOUR"
+			// Default to last 7 days to catch older errors
+			query += " AND ei.occurred_at >= now() - INTERVAL 7 DAY"
 		}
 		if timeTo != "" {
-			query += fmt.Sprintf(" AND start_ts <= '%s'", timeTo)
+			// Convert ISO format to ClickHouse DateTime format
+			timeToFormatted := strings.ReplaceAll(timeTo, "T", " ")
+			timeToFormatted = strings.ReplaceAll(timeToFormatted, "Z", "")
+			if len(timeToFormatted) > 19 {
+				timeToFormatted = timeToFormatted[:19]
+			}
+			query += fmt.Sprintf(" AND ei.occurred_at <= '%s'", timeToFormatted)
 		}
 		
-		query += " GROUP BY service, name ORDER BY count DESC"
+		query += " GROUP BY ei.error_type, ei.error_message, sm.service"
+		query += " ORDER BY count DESC, last_seen DESC"
 		limitInt, _ := strconv.Atoi(limit)
 		query += fmt.Sprintf(" LIMIT %d", limitInt)
 		
@@ -3181,16 +3800,23 @@ func main() {
 		var errors []map[string]interface{}
 		for _, row := range rows {
 			serviceName := getString(row, "service")
-			errorName := getString(row, "name")
-			errorId := fmt.Sprintf("%s:%s", serviceName, errorName)
+			errorType := getString(row, "error_type")
+			errorMessage := getString(row, "error_message")
+			
+			// Create error_id from service and error message
+			errorId := fmt.Sprintf("%s:%s", serviceName, errorMessage)
+			if errorMessage == "" {
+				errorId = fmt.Sprintf("%s:%s", serviceName, errorType)
+			}
 			
 			errors = append(errors, map[string]interface{}{
-				"error_id":   errorId,
-				"error_message": errorName,
-				"service":    serviceName,
-				"count":      getUint64(row, "count"),
-				"first_seen": getString(row, "first_seen"),
-				"last_seen":  getString(row, "last_seen"),
+				"error_id":      errorId,
+				"error_message": errorMessage,
+				"error_type":    errorType,
+				"service":       serviceName,
+				"count":         getUint64(row, "count"),
+				"first_seen":    getString(row, "first_seen"),
+				"last_seen":     getString(row, "last_seen"),
 			})
 		}
 		
@@ -5050,6 +5676,14 @@ type ErrorMessage struct {
 	File            string          `json:"file"`
 	Line            int             `json:"line"`
 	StackTrace      json.RawMessage `json:"stack_trace,omitempty"` // Can be array or string
+	HttpRequest     json.RawMessage `json:"http_request,omitempty"`
+	Tags            json.RawMessage `json:"tags,omitempty"`
+	SqlQueries      json.RawMessage `json:"sql_queries,omitempty"`
+	HttpRequests    json.RawMessage `json:"http_requests,omitempty"`
+	ExceptionCode   *int            `json:"exception_code,omitempty"`
+	Environment     string          `json:"environment,omitempty"`
+	Release         string          `json:"release,omitempty"`
+	UserContext     json.RawMessage `json:"user_context,omitempty"`
 	OrganizationID  string          `json:"organization_id"`
 	ProjectID       string          `json:"project_id"`
 	Service         string          `json:"service"`
@@ -5108,6 +5742,36 @@ func handleErrorMessage(raw json.RawMessage, writer *ClickHouseWriter) {
 		}
 	}
 	
+	// Convert context fields to strings
+	userContextStr := "{}"
+	if len(errMsg.UserContext) > 0 {
+		if errMsg.UserContext[0] == '"' {
+			// It's a JSON string, unmarshal it
+			json.Unmarshal(errMsg.UserContext, &userContextStr)
+		} else {
+			// It's a JSON object, convert to string
+			userContextStr = string(errMsg.UserContext)
+		}
+	}
+	
+	tagsStr := "{}"
+	if len(errMsg.Tags) > 0 {
+		if errMsg.Tags[0] == '"' {
+			// It's a JSON string, unmarshal it
+			json.Unmarshal(errMsg.Tags, &tagsStr)
+		} else {
+			// It's a JSON object, convert to string
+			tagsStr = string(errMsg.Tags)
+		}
+	}
+	
+	// Set environment and release with defaults
+	environment := errMsg.Environment
+	if environment == "" {
+		environment = "production"
+	}
+	release := errMsg.Release
+	
 	// Write error instance
 	errorInstance := map[string]interface{}{
 		"organization_id": errMsg.OrganizationID,
@@ -5120,10 +5784,10 @@ func handleErrorMessage(raw json.RawMessage, writer *ClickHouseWriter) {
 		"error_message":  errMsg.ErrorMessage,
 		"stack_trace":     stackTraceStr,
 		"occurred_at":     occurredAt.Format("2006-01-02 15:04:05"),
-		"environment":     "production",
-		"release":         "",
-		"user_context":   "{}",
-		"tags":            "{}",
+		"environment":     environment,
+		"release":         release,
+		"user_context":   userContextStr,
+		"tags":            tagsStr,
 	}
 	
 	// Write error group (using ReplacingMergeTree, so we can update counts)
@@ -5223,6 +5887,81 @@ func handleLogMessage(raw json.RawMessage, writer *ClickHouseWriter, wsHub *WebS
 		logMsg.Level, logMsg.Message, logMsg.TraceID)
 }
 
+// calculateSpanStatus determines the span status based on HTTP response codes and error indicators
+// This follows New Relic's approach: extension provides data, agent calculates status
+// Returns "error" for errors, "ok" for success, or empty string to keep original status
+func calculateSpanStatus(inc *Incoming) string {
+	// Check HTTP response status code from tags (highest priority - authoritative source)
+	if len(inc.Tags) > 0 {
+		var tagsMap map[string]interface{}
+		if err := json.Unmarshal(inc.Tags, &tagsMap); err == nil {
+			// Check for http_response.status_code
+			if httpResponse, ok := tagsMap["http_response"].(map[string]interface{}); ok {
+				if statusCodeVal, exists := httpResponse["status_code"]; exists {
+					var statusCode int
+					switch v := statusCodeVal.(type) {
+					case float64:
+						statusCode = int(v)
+					case int:
+						statusCode = v
+					case int64:
+						statusCode = int(v)
+					case string:
+						if parsed, err := strconv.Atoi(v); err == nil {
+							statusCode = parsed
+						}
+					}
+					
+					// HTTP status codes >= 400 indicate errors (client or server errors)
+					if statusCode >= 400 {
+						log.Printf("[DEBUG] Status set to error due to HTTP status code %d", statusCode)
+						return "error"
+					}
+					// HTTP status codes 200-399 are success
+					if statusCode >= 200 && statusCode < 400 {
+						return "ok"
+					}
+				}
+			}
+		}
+	}
+	
+	// Check for exceptions/errors in dumps (second priority)
+	if len(inc.Dumps) > 0 {
+		var dumpsArray []interface{}
+		if err := json.Unmarshal(inc.Dumps, &dumpsArray); err == nil {
+			for _, dump := range dumpsArray {
+				if dumpMap, ok := dump.(map[string]interface{}); ok {
+					// Check for error indicators in dump
+					if errorType, hasError := dumpMap["type"].(string); hasError {
+						errorTypeLower := strings.ToLower(errorType)
+						if strings.Contains(errorTypeLower, "error") || 
+						   strings.Contains(errorTypeLower, "exception") ||
+						   strings.Contains(errorTypeLower, "fatal") {
+							log.Printf("[DEBUG] Status set to error due to error type in dumps: %s", errorType)
+							return "error"
+						}
+					}
+				}
+			}
+		}
+	}
+	
+	// If status is already explicitly set to error, keep it
+	if inc.Status == "error" || inc.Status == "0" {
+		return "" // Keep existing error status
+	}
+	
+	// If no errors detected and status is not explicitly set, default to "ok"
+	// This handles the case where extension sends status=-1 (not set)
+	if inc.Status == "" || inc.Status == "-1" {
+		return "ok"
+	}
+	
+	// Keep existing status if it's already set to "ok" or "1"
+	return ""
+}
+
 // getOrCreateServiceMapProcessor gets or creates a ServiceMapProcessor for the given org/project
 func getOrCreateServiceMapProcessor(orgID, projectID string) *ServiceMapProcessor {
 	key := fmt.Sprintf("%s:%s", orgID, projectID)
@@ -5313,6 +6052,15 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 					}
 				}
 			}
+		}
+		
+		// Calculate status based on HTTP response code and error indicators (New Relic-style)
+		// Extension provides data, agent calculates status for better performance
+		calculatedStatus := calculateSpanStatus(&inc)
+		if calculatedStatus != "" {
+			originalStatus := inc.Status
+			inc.Status = calculatedStatus
+			log.Printf("[DEBUG] Calculated status for span %s: %s (was: %s)", inc.SpanID, calculatedStatus, originalStatus)
 		}
 		
 		// Apply sampling (using proper random sampling, not time-based)
@@ -5455,20 +6203,42 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 		}
 		
 		// Process SQL queries from call stack
+		// Collect all SQL queries and use the first valid one for fingerprinting
+		// This ensures we don't miss queries in later call nodes
 		if len(inc.Stack) > 0 {
 			callStack := parseCallStack(inc.Stack)
 			for _, callNode := range callStack {
 				if len(callNode.SQLQueries) > 0 {
 					for _, sqlQuery := range callNode.SQLQueries {
 						if sqlMap, ok := sqlQuery.(map[string]interface{}); ok {
-							if v, ok := sqlMap["db_system"].(string); ok {
-								min["db_system"] = v
+							// Set db_system if not already set
+							if _, exists := min["db_system"]; !exists {
+								if v, ok := sqlMap["db_system"].(string); ok && v != "" {
+									min["db_system"] = v
+								}
 							}
-							// Use first query for fingerprint
-							if query, ok := sqlMap["query"].(string); ok {
-								min["query_fingerprint"] = query
+							// Use first valid query for fingerprint (only if not already set)
+							if _, exists := min["query_fingerprint"]; !exists {
+								if query, ok := sqlMap["query"].(string); ok && query != "" {
+									fingerprint := normalizeSQLQuery(query)
+									if fingerprint != "" {
+										min["query_fingerprint"] = fingerprint
+										// Found a valid fingerprint, but continue to check for db_system
+									}
+								}
 							}
-							break // Use first query for min row
+							// If we have both db_system and fingerprint, we can break
+							if _, hasDB := min["db_system"]; hasDB {
+								if _, hasFP := min["query_fingerprint"]; hasFP {
+									break
+								}
+							}
+						}
+					}
+					// If we found a fingerprint, we can stop processing call nodes
+					if _, exists := min["query_fingerprint"]; exists {
+						if _, hasDB := min["db_system"]; hasDB {
+							break
 						}
 					}
 				}
@@ -5476,16 +6246,25 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 		}
 		
 		// Also check direct SQL field (backward compatibility)
-		if inc.Sql != nil {
+		// Only use if we didn't find a fingerprint from call stack
+		if _, exists := min["query_fingerprint"]; !exists && inc.Sql != nil {
 			var sqlArray []interface{}
 			if err := json.Unmarshal(inc.Sql, &sqlArray); err == nil {
-				if len(sqlArray) > 0 {
-					if sqlMap, ok := sqlArray[0].(map[string]interface{}); ok {
-						if v, ok := sqlMap["db_system"].(string); ok {
-							min["db_system"] = v
+				for _, sqlItem := range sqlArray {
+					if sqlMap, ok := sqlItem.(map[string]interface{}); ok {
+						// Set db_system if not already set
+						if _, exists := min["db_system"]; !exists {
+							if v, ok := sqlMap["db_system"].(string); ok && v != "" {
+								min["db_system"] = v
+							}
 						}
-						if query, ok := sqlMap["query"].(string); ok {
-							min["query_fingerprint"] = query
+						// Use first valid query for fingerprint
+						if query, ok := sqlMap["query"].(string); ok && query != "" {
+							fingerprint := normalizeSQLQuery(query)
+							if fingerprint != "" {
+								min["query_fingerprint"] = fingerprint
+								break // Found valid fingerprint
+							}
 						}
 					}
 				}
@@ -5521,6 +6300,77 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 		
 		hasProfilingData := hasSqlData || hasHttpData || hasCacheData || hasRedisData || hasProfilingDataInStack
 		
+		// Aggregate all SQL queries, HTTP requests, Redis operations, and cache operations
+		// This is needed both for full span storage and service map processing
+			var allSQLQueries []interface{}
+		var allHttpRequests []interface{}
+		var allCacheOps []interface{}
+		var allRedisOps []interface{}
+			
+		// Aggregate SQL queries: from inc.Sql (direct field) and from call stack
+			if len(inc.Sql) > 0 {
+				var sqlArray []interface{}
+				if err := json.Unmarshal(inc.Sql, &sqlArray); err == nil {
+					allSQLQueries = append(allSQLQueries, sqlArray...)
+				}
+			}
+			if len(inc.Stack) > 0 {
+				callStack := parseCallStack(inc.Stack)
+				stackQueries := collectSQLQueriesFromCallStack(callStack)
+				if len(stackQueries) > 0 {
+					allSQLQueries = append(allSQLQueries, stackQueries...)
+				}
+			}
+			
+		// Aggregate HTTP requests: from direct field and from call stack
+			if len(inc.Http) > 0 {
+				var httpArray []interface{}
+				if err := json.Unmarshal(inc.Http, &httpArray); err == nil {
+					allHttpRequests = append(allHttpRequests, httpArray...)
+				log.Printf("[DEBUG] Service map: found %d HTTP requests in inc.Http for service %s", len(httpArray), inc.Service)
+				}
+			}
+			if len(inc.Stack) > 0 {
+				callStack := parseCallStack(inc.Stack)
+				stackRequests := collectHttpRequestsFromCallStack(callStack)
+				if len(stackRequests) > 0 {
+					allHttpRequests = append(allHttpRequests, stackRequests...)
+				log.Printf("[DEBUG] Service map: found %d HTTP requests in call stack for service %s", len(stackRequests), inc.Service)
+				}
+			}
+			
+		// Aggregate cache operations: from direct field and from call stack
+			if len(inc.Cache) > 0 {
+				var cacheArray []interface{}
+				if err := json.Unmarshal(inc.Cache, &cacheArray); err == nil {
+					allCacheOps = append(allCacheOps, cacheArray...)
+				}
+			}
+			if len(inc.Stack) > 0 {
+				callStack := parseCallStack(inc.Stack)
+				stackCacheOps := collectCacheOperationsFromCallStack(callStack)
+				if len(stackCacheOps) > 0 {
+					allCacheOps = append(allCacheOps, stackCacheOps...)
+				}
+			}
+			
+		// Aggregate Redis operations: from direct field and from call stack
+			if len(inc.Redis) > 0 {
+				var redisArray []interface{}
+				if err := json.Unmarshal(inc.Redis, &redisArray); err == nil {
+					allRedisOps = append(allRedisOps, redisArray...)
+				log.Printf("[DEBUG] Service map: found %d Redis operations in inc.Redis for service %s", len(redisArray), inc.Service)
+				}
+			}
+			if len(inc.Stack) > 0 {
+				callStack := parseCallStack(inc.Stack)
+				stackRedisOps := collectRedisOperationsFromCallStack(callStack)
+				if len(stackRedisOps) > 0 {
+					allRedisOps = append(allRedisOps, stackRedisOps...)
+				log.Printf("[DEBUG] Service map: found %d Redis operations in call stack for service %s", len(stackRedisOps), inc.Service)
+				}
+			}
+		
 		// Store full span if: trace should be kept, chunk is done, call stack present, dumps present, any profiling data present, OR always (to capture events even with empty call stack)
 		// Always storing ensures we capture all profiling data regardless of call stack state
 		shouldStoreFull := tb.ShouldKeep(inc.TraceID) || (inc.ChunkDone != nil && *inc.ChunkDone) || hasCallStack || hasDumps || hasProfilingData || true
@@ -5533,26 +6383,6 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 				}
 			}
 			
-			// Aggregate all SQL queries: from inc.Sql (direct field) and from call stack
-			var allSQLQueries []interface{}
-			
-			// Collect from direct SQL field (backward compatibility)
-			if len(inc.Sql) > 0 {
-				var sqlArray []interface{}
-				if err := json.Unmarshal(inc.Sql, &sqlArray); err == nil {
-					allSQLQueries = append(allSQLQueries, sqlArray...)
-				}
-			}
-			
-			// Collect from call stack (main method)
-			if len(inc.Stack) > 0 {
-				callStack := parseCallStack(inc.Stack)
-				stackQueries := collectSQLQueriesFromCallStack(callStack)
-				if len(stackQueries) > 0 {
-					allSQLQueries = append(allSQLQueries, stackQueries...)
-				}
-			}
-			
 			// Serialize aggregated SQL queries to JSON string
 			sqlJSON := "[]"
 			if len(allSQLQueries) > 0 {
@@ -5561,26 +6391,9 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 				} else {
 					LogError(err, "Failed to marshal SQL queries", nil)
 				}
-			} else {
 			}
 			
-			// Aggregate HTTP requests: from direct field (backward compatibility) and from call stack
-			var allHttpRequests []interface{}
-			// Collect from direct HTTP field (backward compatibility)
-			if len(inc.Http) > 0 {
-				var httpArray []interface{}
-				if err := json.Unmarshal(inc.Http, &httpArray); err == nil {
-					allHttpRequests = append(allHttpRequests, httpArray...)
-				}
-			}
-			// Collect from call stack
-			if len(inc.Stack) > 0 {
-				callStack := parseCallStack(inc.Stack)
-				stackRequests := collectHttpRequestsFromCallStack(callStack)
-				if len(stackRequests) > 0 {
-					allHttpRequests = append(allHttpRequests, stackRequests...)
-				}
-			}
+			// Serialize aggregated HTTP requests to JSON string
 			httpJSON := "[]"
 			if len(allHttpRequests) > 0 {
 				if httpBytes, err := json.Marshal(allHttpRequests); err == nil {
@@ -5588,23 +6401,7 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 				}
 			}
 			
-			// Aggregate cache operations: from direct field (backward compatibility) and from call stack
-			var allCacheOps []interface{}
-			// Collect from direct Cache field (backward compatibility)
-			if len(inc.Cache) > 0 {
-				var cacheArray []interface{}
-				if err := json.Unmarshal(inc.Cache, &cacheArray); err == nil {
-					allCacheOps = append(allCacheOps, cacheArray...)
-				}
-			}
-			// Collect from call stack
-			if len(inc.Stack) > 0 {
-				callStack := parseCallStack(inc.Stack)
-				stackCacheOps := collectCacheOperationsFromCallStack(callStack)
-				if len(stackCacheOps) > 0 {
-					allCacheOps = append(allCacheOps, stackCacheOps...)
-				}
-			}
+			// Serialize aggregated cache operations to JSON string
 			cacheJSON := "[]"
 			if len(allCacheOps) > 0 {
 				if cacheBytes, err := json.Marshal(allCacheOps); err == nil {
@@ -5612,23 +6409,7 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 				}
 			}
 			
-			// Aggregate Redis operations: from direct field (backward compatibility) and from call stack
-			var allRedisOps []interface{}
-			// Collect from direct Redis field (backward compatibility)
-			if len(inc.Redis) > 0 {
-				var redisArray []interface{}
-				if err := json.Unmarshal(inc.Redis, &redisArray); err == nil {
-					allRedisOps = append(allRedisOps, redisArray...)
-				}
-			}
-			// Collect from call stack
-			if len(inc.Stack) > 0 {
-				callStack := parseCallStack(inc.Stack)
-				stackRedisOps := collectRedisOperationsFromCallStack(callStack)
-				if len(stackRedisOps) > 0 {
-					allRedisOps = append(allRedisOps, stackRedisOps...)
-				}
-			}
+			// Serialize aggregated Redis operations to JSON string
 			redisJSON := "[]"
 			if len(allRedisOps) > 0 {
 				if redisBytes, err := json.Marshal(allRedisOps); err == nil {
@@ -5766,6 +6547,30 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 				if err := json.Unmarshal(inc.Net, &net); err == nil {
 					span.Net = net
 				}
+			}
+			
+			// Populate HTTP requests for service map processing
+			if len(allHttpRequests) > 0 {
+				span.Http = allHttpRequests
+				log.Printf("[DEBUG] Service map: populated %d HTTP requests for service %s", len(allHttpRequests), span.Service)
+			}
+			
+			// Populate Redis operations for service map processing
+			if len(allRedisOps) > 0 {
+				span.Redis = allRedisOps
+				log.Printf("[DEBUG] Service map: populated %d Redis operations for service %s", len(allRedisOps), span.Service)
+			}
+			
+			// Populate SQL queries for service map processing
+			if len(allSQLQueries) > 0 {
+				span.Sql = allSQLQueries
+				log.Printf("[DEBUG] Service map: populated %d SQL queries for service %s", len(allSQLQueries), span.Service)
+			}
+			
+			// Populate cache operations for service map processing
+			if len(allCacheOps) > 0 {
+				span.Cache = allCacheOps
+				log.Printf("[DEBUG] Service map: populated %d cache operations for service %s", len(allCacheOps), span.Service)
 			}
 			
 			// Try to find parent span from TailBuffer

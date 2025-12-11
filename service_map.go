@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -234,8 +233,6 @@ func (smp *ServiceMapProcessor) ProcessExternalDependencies(span *Span) {
 					if recv, ok := httpMap["bytes_received"].(float64); ok {
 						dep.BytesReceived += int64(recv)
 					}
-				} else {
-					log.Printf("[DEBUG] ServiceMap: HTTP item has no URL field: %+v", httpMap)
 				}
 			}
 		}
