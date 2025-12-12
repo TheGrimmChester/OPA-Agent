@@ -3565,6 +3565,368 @@ func main() {
 		http.Error(w, "not found", 404)
 	})
 	
+	// Get HTTP calls across all services (or filtered by service)
+	mux.HandleFunc("/api/http-calls", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		
+		ctx, _ := ExtractTenantContext(r, queryClient)
+		timeFrom := r.URL.Query().Get("from")
+		timeTo := r.URL.Query().Get("to")
+		serviceFilter := r.URL.Query().Get("service")
+		limit := r.URL.Query().Get("limit")
+		offset := r.URL.Query().Get("offset")
+		
+		if limit == "" {
+			limit = "100"
+		}
+		limitInt, _ := strconv.Atoi(limit)
+		if limitInt > 500 {
+			limitInt = 500
+		}
+		if limitInt < 1 {
+			limitInt = 100
+		}
+		
+		offsetInt := 0
+		if offset != "" {
+			offsetInt, _ = strconv.Atoi(offset)
+			if offsetInt < 0 {
+				offsetInt = 0
+			}
+		}
+		
+		// Build query to get HTTP requests
+		// Include both http field (outgoing requests) and tags field (incoming requests)
+		var query string
+		if ctx.IsAllTenants() {
+			query = fmt.Sprintf(`SELECT 
+				http,
+				tags,
+				service,
+				start_ts,
+				duration_ms,
+				status,
+				trace_id,
+				span_id
+				FROM opa.spans_full 
+				WHERE (http != '' AND http != '[]' AND http != 'null') OR (tags != '' AND tags != '{}' AND tags LIKE '%%http_request%%')`)
+		} else {
+			query = fmt.Sprintf(`SELECT 
+				http,
+				tags,
+				service,
+				start_ts,
+				duration_ms,
+				status,
+				trace_id,
+				span_id
+				FROM opa.spans_full 
+				WHERE (coalesce(nullif(organization_id, ''), 'default-org') = '%s' AND coalesce(nullif(project_id, ''), 'default-project') = '%s') 
+					AND ((http != '' AND http != '[]' AND http != 'null') OR (tags != '' AND tags != '{}' AND tags LIKE '%%http_request%%'))`,
+				escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID))
+		}
+		
+		if serviceFilter != "" {
+			query += fmt.Sprintf(" AND service = '%s'", escapeSQL(serviceFilter))
+		}
+		
+		if timeFrom != "" {
+			query += fmt.Sprintf(" AND start_ts >= '%s'", escapeSQL(timeFrom))
+		}
+		if timeTo != "" {
+			query += fmt.Sprintf(" AND start_ts <= '%s'", escapeSQL(timeTo))
+		}
+		
+		// Apply pagination - we'll fetch more rows than needed to aggregate properly
+		// Since we're grouping, we need to fetch all matching rows, aggregate, then paginate
+		query += " ORDER BY start_ts DESC"
+		
+		rows, err := queryClient.Query(query)
+		if err != nil {
+			LogError(err, "Failed to fetch HTTP calls", map[string]interface{}{
+				"service": serviceFilter,
+			})
+			http.Error(w, "failed to fetch HTTP calls", 500)
+			return
+		}
+		
+		// Aggregate HTTP calls by URL + Method
+		type HttpCallStats struct {
+			URL              string
+			URI              string
+			Method           string
+			Service          string
+			CallCount        int64
+			TotalDuration    float64
+			ErrorCount       int64
+			TotalBytesSent   int64
+			TotalBytesRecv   int64
+			MinDuration      float64
+			MaxDuration      float64
+		}
+		httpCallsMap := make(map[string]*HttpCallStats)
+		totalCalls := int64(0)
+		
+		// Helper function to process HTTP requests from either http field or tags
+		processHttpRequestFromField := func(req map[string]interface{}, httpCallsMap map[string]*HttpCallStats, serviceName string, totalCalls *int64) {
+			requestURL := ""
+			if u, ok := req["url"].(string); ok && u != "" {
+				requestURL = u
+			} else if u, ok := req["URL"].(string); ok && u != "" {
+				requestURL = u
+			}
+			if requestURL == "" {
+				return
+			}
+			
+			method := "GET"
+			if m, ok := req["method"].(string); ok && m != "" {
+				method = m
+			}
+			
+			// Extract URI from URL (remove scheme and host)
+			uri := ""
+			if u, ok := req["uri"].(string); ok && u != "" {
+				uri = u
+				// Add query string if present
+				if qs, ok := req["query_string"].(string); ok && qs != "" {
+					uri = uri + "?" + qs
+				}
+			} else {
+				// Try to extract URI from URL
+				if strings.HasPrefix(requestURL, "http://") || strings.HasPrefix(requestURL, "https://") {
+					if parsedURL, err := url.Parse(requestURL); err == nil {
+						uri = parsedURL.Path
+						if parsedURL.RawQuery != "" {
+							uri = uri + "?" + parsedURL.RawQuery
+						}
+					} else {
+						uri = requestURL
+					}
+				} else {
+					uri = requestURL
+				}
+			}
+			
+			// Group by method + URI (service is included in response but not in grouping key)
+			key := fmt.Sprintf("%s %s", method, uri)
+			
+			call, exists := httpCallsMap[key]
+			if !exists {
+				call = &HttpCallStats{
+					URL:           requestURL,
+					URI:           uri,
+					Method:        method,
+					Service:       serviceName,
+					MinDuration:   999999.0,
+					MaxDuration:   0.0,
+				}
+				httpCallsMap[key] = call
+			}
+			
+			call.CallCount++
+			*totalCalls++
+			
+			var duration float64
+			if d, ok := req["duration_ms"].(float64); ok {
+				duration = d
+			} else if d, ok := req["duration"].(float64); ok {
+				duration = d * 1000.0
+			}
+			
+			if duration > 0 {
+				call.TotalDuration += duration
+				if duration < call.MinDuration {
+					call.MinDuration = duration
+				}
+				if duration > call.MaxDuration {
+					call.MaxDuration = duration
+				}
+			}
+			
+			statusCode := 0
+			if sc, ok := req["status_code"].(float64); ok {
+				statusCode = int(sc)
+			} else if sc, ok := req["statusCode"].(float64); ok {
+				statusCode = int(sc)
+			}
+			
+			if statusCode >= 400 {
+				call.ErrorCount++
+			} else if err, ok := req["error"].(string); ok && err != "" {
+				call.ErrorCount++
+			}
+			
+			// Extract bytes sent
+			if sent, ok := req["bytes_sent"].(float64); ok {
+				call.TotalBytesSent += int64(sent)
+			} else if sent, ok := req["request_size"].(float64); ok {
+				call.TotalBytesSent += int64(sent)
+			} else if sent, ok := req["curl_bytes_sent"].(float64); ok {
+				call.TotalBytesSent += int64(sent)
+			}
+			// Extract bytes received
+			if recv, ok := req["bytes_received"].(float64); ok {
+				call.TotalBytesRecv += int64(recv)
+			} else if recv, ok := req["response_size"].(float64); ok {
+				call.TotalBytesRecv += int64(recv)
+			} else if recv, ok := req["curl_bytes_received"].(float64); ok {
+				call.TotalBytesRecv += int64(recv)
+			}
+		}
+		
+		for _, row := range rows {
+			serviceName := getString(row, "service")
+			durationMs := getFloat64(row, "duration_ms")
+			spanStatus := getString(row, "status")
+			
+			// First, process outgoing HTTP requests from http field
+			httpData := getString(row, "http")
+			if httpData != "" && httpData != "[]" && httpData != "null" {
+				// Parse HTTP requests JSON array
+				var httpRequests []map[string]interface{}
+				if err := json.Unmarshal([]byte(httpData), &httpRequests); err == nil {
+					for _, req := range httpRequests {
+						processHttpRequestFromField(req, httpCallsMap, serviceName, &totalCalls)
+					}
+				}
+			}
+			
+			// Second, process incoming HTTP requests from tags field
+			tagsData := getString(row, "tags")
+			if tagsData != "" && tagsData != "{}" {
+				var tagsMap map[string]interface{}
+				if err := json.Unmarshal([]byte(tagsData), &tagsMap); err == nil {
+					if httpRequest, ok := tagsMap["http_request"].(map[string]interface{}); ok {
+						// Build request object from tags
+						req := make(map[string]interface{})
+						
+						// Build URL from http_request components
+						scheme := ""
+						if s, ok := httpRequest["scheme"].(string); ok {
+							scheme = s
+						}
+						host := ""
+						if h, ok := httpRequest["host"].(string); ok {
+							host = h
+						}
+						uri := ""
+						if u, ok := httpRequest["uri"].(string); ok {
+							uri = u
+						}
+						
+						// Construct full URL
+						url := ""
+						if scheme != "" && host != "" {
+							url = fmt.Sprintf("%s://%s%s", scheme, host, uri)
+						} else if host != "" {
+							url = fmt.Sprintf("%s%s", host, uri)
+						} else if uri != "" {
+							url = uri
+						}
+						
+						if url != "" {
+							req["url"] = url
+							
+							// Build URI with query string if present
+							uriWithQuery := uri
+							if qs, ok := httpRequest["query_string"].(string); ok && qs != "" {
+								uriWithQuery = uri + "?" + qs
+								req["url"] = url + "?" + qs
+							}
+							req["uri"] = uriWithQuery
+							
+							// Get method
+							if m, ok := httpRequest["method"].(string); ok {
+								req["method"] = m
+							}
+							
+							// Get status code from http_response
+							if httpResponse, ok := tagsMap["http_response"].(map[string]interface{}); ok {
+								if sc, ok := httpResponse["status_code"].(float64); ok {
+									req["status_code"] = sc
+								}
+							}
+							
+							// Use span duration
+							if durationMs > 0 {
+								req["duration_ms"] = durationMs
+							}
+							
+							// Check for errors
+							if spanStatus == "error" || spanStatus == "0" {
+								req["error"] = "span_error"
+							}
+							
+							processHttpRequestFromField(req, httpCallsMap, serviceName, &totalCalls)
+						}
+					}
+				}
+			}
+		}
+		
+		// Convert to array and calculate averages
+		httpCalls := make([]map[string]interface{}, 0, len(httpCallsMap))
+		for _, call := range httpCallsMap {
+			avgDuration := 0.0
+			errorRate := 0.0
+			if call.CallCount > 0 {
+				avgDuration = call.TotalDuration / float64(call.CallCount)
+				errorRate = float64(call.ErrorCount) / float64(call.CallCount) * 100.0
+				if call.MinDuration == 999999.0 {
+					call.MinDuration = 0.0
+				}
+			}
+			
+			httpCalls = append(httpCalls, map[string]interface{}{
+				"url":                 call.URL,
+				"uri":                 call.URI,
+				"method":             call.Method,
+				"service":            call.Service,
+				"call_count":         call.CallCount,
+				"avg_duration":       avgDuration,
+				"min_duration":       call.MinDuration,
+				"max_duration":       call.MaxDuration,
+				"error_count":       call.ErrorCount,
+				"error_rate":        errorRate,
+				"total_bytes_sent":   call.TotalBytesSent,
+				"total_bytes_received": call.TotalBytesRecv,
+			})
+		}
+		
+		// Sort by call count descending
+		sort.Slice(httpCalls, func(i, j int) bool {
+			ci, _ := httpCalls[i]["call_count"].(int64)
+			cj, _ := httpCalls[j]["call_count"].(int64)
+			return ci > cj
+		})
+		
+		// Apply pagination
+		total := int64(len(httpCalls))
+		startIdx := offsetInt
+		endIdx := offsetInt + limitInt
+		if startIdx > len(httpCalls) {
+			startIdx = len(httpCalls)
+		}
+		if endIdx > len(httpCalls) {
+			endIdx = len(httpCalls)
+		}
+		if startIdx < 0 {
+			startIdx = 0
+		}
+		
+		paginatedCalls := httpCalls[startIdx:endIdx]
+		
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"http_calls":  paginatedCalls,
+			"total":       total,
+			"total_calls": totalCalls,
+		})
+	})
+	
 	// Get list of languages
 	mux.HandleFunc("/api/languages", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
@@ -6915,6 +7277,85 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 			if len(allHttpRequests) > 0 {
 				if httpBytes, err := json.Marshal(allHttpRequests); err == nil {
 					httpJSON = string(httpBytes)
+					
+					// Broadcast HTTP requests via WebSocket
+					if wsHub != nil {
+						// Send individual HTTP requests
+						for _, httpReq := range allHttpRequests {
+							if reqMap, ok := httpReq.(map[string]interface{}); ok {
+								// Extract request data
+								broadcastData := map[string]interface{}{
+									"trace_id":   inc.TraceID,
+									"span_id":    inc.SpanID,
+									"service":    inc.Service,
+									"span_name":  inc.Name,
+									"timestamp":  time.Now().Unix(),
+								}
+								
+								// Copy HTTP request fields
+								if method, ok := reqMap["method"].(string); ok {
+									broadcastData["method"] = method
+								}
+								if url, ok := reqMap["url"].(string); ok {
+									broadcastData["url"] = url
+								} else if url, ok := reqMap["URL"].(string); ok {
+									broadcastData["url"] = url
+								}
+								if uri, ok := reqMap["uri"].(string); ok {
+									broadcastData["uri"] = uri
+								}
+								if statusCode, ok := reqMap["status_code"].(float64); ok {
+									broadcastData["status_code"] = int(statusCode)
+								} else if statusCode, ok := reqMap["statusCode"].(float64); ok {
+									broadcastData["status_code"] = int(statusCode)
+								}
+								if duration, ok := reqMap["duration_ms"].(float64); ok {
+									broadcastData["duration_ms"] = duration
+								} else if duration, ok := reqMap["duration"].(float64); ok {
+									broadcastData["duration_ms"] = duration * 1000.0
+								}
+								if bytesSent, ok := reqMap["bytes_sent"].(float64); ok {
+									broadcastData["bytes_sent"] = int64(bytesSent)
+								} else if bytesSent, ok := reqMap["request_size"].(float64); ok {
+									broadcastData["bytes_sent"] = int64(bytesSent)
+								}
+								if bytesRecv, ok := reqMap["bytes_received"].(float64); ok {
+									broadcastData["bytes_received"] = int64(bytesRecv)
+								} else if bytesRecv, ok := reqMap["response_size"].(float64); ok {
+									broadcastData["bytes_received"] = int64(bytesRecv)
+								}
+								if queryString, ok := reqMap["query_string"].(string); ok {
+									broadcastData["query_string"] = queryString
+								}
+								if reqHeaders, ok := reqMap["request_headers"].(map[string]interface{}); ok {
+									broadcastData["request_headers"] = reqHeaders
+								} else if reqHeadersRaw, ok := reqMap["request_headers_raw"].(string); ok && reqHeadersRaw != "" {
+									// Try to parse raw headers
+									var headersMap map[string]interface{}
+									if err := json.Unmarshal([]byte(reqHeadersRaw), &headersMap); err == nil {
+										broadcastData["request_headers"] = headersMap
+									}
+								}
+								if respHeaders, ok := reqMap["response_headers"].(map[string]interface{}); ok {
+									broadcastData["response_headers"] = respHeaders
+								} else if respHeadersRaw, ok := reqMap["response_headers_raw"].(string); ok && respHeadersRaw != "" {
+									// Try to parse raw headers
+									var headersMap map[string]interface{}
+									if err := json.Unmarshal([]byte(respHeadersRaw), &headersMap); err == nil {
+										broadcastData["response_headers"] = headersMap
+									}
+								}
+								if reqBody, ok := reqMap["request_body"]; ok {
+									broadcastData["request_body"] = reqBody
+								}
+								if respBody, ok := reqMap["response_body"]; ok {
+									broadcastData["response_body"] = respBody
+								}
+								
+								wsHub.Broadcast("http", broadcastData)
+							}
+						}
+					}
 				}
 			}
 			
@@ -6970,11 +7411,108 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 			if len(tagsStr) > 0 {
 				hasHttpRequest := strings.Contains(tagsStr, "\"http_request\"") || strings.Contains(tagsStr, "http_request")
 				
-				// If http_request is missing, add it (even if empty) to ensure it's always present
-				if !hasHttpRequest {
-					// Parse tags to add http_request
-					var tagsMap map[string]interface{}
-					if err := json.Unmarshal(inc.Tags, &tagsMap); err == nil {
+				// Parse tags to check for HTTP request data
+				var tagsMap map[string]interface{}
+				if err := json.Unmarshal(inc.Tags, &tagsMap); err == nil {
+					// Broadcast HTTP request from tags if present
+					if httpRequest, ok := tagsMap["http_request"].(map[string]interface{}); ok && wsHub != nil {
+						// Get http_response if available
+						var httpResponse map[string]interface{}
+						if resp, ok := tagsMap["http_response"].(map[string]interface{}); ok {
+							httpResponse = resp
+						}
+						
+						// Build request object from tags
+						broadcastData := map[string]interface{}{
+							"trace_id":   inc.TraceID,
+							"span_id":    inc.SpanID,
+							"service":    inc.Service,
+							"span_name":  inc.Name,
+							"timestamp":  time.Now().Unix(),
+						}
+						
+						// Build URL from http_request components
+						scheme := ""
+						if s, ok := httpRequest["scheme"].(string); ok {
+							scheme = s
+						}
+						host := ""
+						if h, ok := httpRequest["host"].(string); ok {
+							host = h
+						}
+						uri := ""
+						if u, ok := httpRequest["uri"].(string); ok {
+							uri = u
+						}
+						
+						// Construct full URL
+						url := ""
+						if scheme != "" && host != "" {
+							url = fmt.Sprintf("%s://%s%s", scheme, host, uri)
+						} else if host != "" {
+							url = fmt.Sprintf("%s%s", host, uri)
+						} else if uri != "" {
+							url = uri
+						}
+						
+						if url != "" {
+							broadcastData["url"] = url
+							broadcastData["uri"] = uri
+							
+							// Get method
+							if m, ok := httpRequest["method"].(string); ok {
+								broadcastData["method"] = m
+							}
+							
+							// Get query string
+							if qs, ok := httpRequest["query_string"].(string); ok && qs != "" {
+								broadcastData["query_string"] = qs
+								broadcastData["url"] = url + "?" + qs
+							}
+							
+							// Get status code from http_response
+							if httpResponse != nil {
+								if sc, ok := httpResponse["status_code"].(float64); ok {
+									broadcastData["status_code"] = int(sc)
+								}
+							}
+							
+							// Use span duration
+							if inc.Duration > 0 {
+								broadcastData["duration_ms"] = inc.Duration
+							}
+							
+							// Get request/response headers and body if available
+							if reqHeaders, ok := httpRequest["request_headers"].(map[string]interface{}); ok {
+								broadcastData["request_headers"] = reqHeaders
+							}
+							if reqBody, ok := httpRequest["request_body"]; ok {
+								broadcastData["request_body"] = reqBody
+							}
+							if httpResponse != nil {
+								if respHeaders, ok := httpResponse["response_headers"].(map[string]interface{}); ok {
+									broadcastData["response_headers"] = respHeaders
+								}
+								if respBody, ok := httpResponse["response_body"]; ok {
+									broadcastData["response_body"] = respBody
+								}
+								// Get bytes sent/received
+								if respSize, ok := httpResponse["response_size"].(float64); ok {
+									broadcastData["bytes_received"] = int64(respSize)
+								}
+							}
+							
+							// Get bytes sent
+							if reqSize, ok := httpRequest["request_size"].(float64); ok {
+								broadcastData["bytes_sent"] = int64(reqSize)
+							}
+							
+							wsHub.Broadcast("http", broadcastData)
+						}
+					}
+					
+					// If http_request is missing, add it (even if empty) to ensure it's always present
+					if !hasHttpRequest {
 						// Add empty http_request if not present
 						if _, exists := tagsMap["http_request"]; !exists {
 							tagsMap["http_request"] = map[string]interface{}{}
