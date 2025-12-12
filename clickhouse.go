@@ -198,7 +198,15 @@ func (w *ClickHouseWriter) AddLog(logEntry map[string]interface{}) {
 		if err != nil {
 			LogError(err, "Failed to write log to ClickHouse", nil)
 		} else {
+			bodyBytes, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
+			if resp.StatusCode != 200 {
+				LogError(nil, "ClickHouse log INSERT failed", map[string]interface{}{
+					"status_code": resp.StatusCode,
+					"body":        string(bodyBytes),
+					"log_data":    string(logData),
+				})
+			}
 		}
 	}()
 }
