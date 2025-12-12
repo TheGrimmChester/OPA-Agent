@@ -2680,13 +2680,23 @@ func main() {
 				}
 				if status, ok := req["status"].(string); ok && (status == "error" || status == "0") {
 					dep["error_count"] = dep["error_count"].(int64) + 1
-				} else if statusCode, ok := req["status_code"].(float64); ok && statusCode >= 400 {
+				} else 				if statusCode, ok := req["status_code"].(float64); ok && statusCode >= 400 {
 					dep["error_count"] = dep["error_count"].(int64) + 1
 				}
+				// Extract bytes sent - prefer bytes_sent, fallback to request_size
 				if sent, ok := req["bytes_sent"].(float64); ok {
 					dep["total_bytes_sent"] = dep["total_bytes_sent"].(int64) + int64(sent)
+				} else if sent, ok := req["request_size"].(float64); ok {
+					dep["total_bytes_sent"] = dep["total_bytes_sent"].(int64) + int64(sent)
+				} else if sent, ok := req["curl_bytes_sent"].(float64); ok {
+					dep["total_bytes_sent"] = dep["total_bytes_sent"].(int64) + int64(sent)
 				}
+				// Extract bytes received - prefer bytes_received, fallback to response_size
 				if recv, ok := req["bytes_received"].(float64); ok {
+					dep["total_bytes_received"] = dep["total_bytes_received"].(int64) + int64(recv)
+				} else if recv, ok := req["response_size"].(float64); ok {
+					dep["total_bytes_received"] = dep["total_bytes_received"].(int64) + int64(recv)
+				} else if recv, ok := req["curl_bytes_received"].(float64); ok {
 					dep["total_bytes_received"] = dep["total_bytes_received"].(int64) + int64(recv)
 				}
 			}
@@ -3491,10 +3501,20 @@ func main() {
 						call.ErrorCount++
 					}
 					
+					// Extract bytes sent - prefer bytes_sent, fallback to request_size
 					if sent, ok := req["bytes_sent"].(float64); ok {
 						call.TotalBytesSent += int64(sent)
+					} else if sent, ok := req["request_size"].(float64); ok {
+						call.TotalBytesSent += int64(sent)
+					} else if sent, ok := req["curl_bytes_sent"].(float64); ok {
+						call.TotalBytesSent += int64(sent)
 					}
+					// Extract bytes received - prefer bytes_received, fallback to response_size
 					if recv, ok := req["bytes_received"].(float64); ok {
+						call.TotalBytesRecv += int64(recv)
+					} else if recv, ok := req["response_size"].(float64); ok {
+						call.TotalBytesRecv += int64(recv)
+					} else if recv, ok := req["curl_bytes_received"].(float64); ok {
 						call.TotalBytesRecv += int64(recv)
 					}
 				}

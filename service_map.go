@@ -227,10 +227,20 @@ func (smp *ServiceMapProcessor) ProcessExternalDependencies(span *Span) {
 					if status, ok := httpMap["status"].(string); ok && (status == "error" || status == "0") {
 						dep.ErrorCount++
 					}
+					// Extract bytes sent - prefer bytes_sent, fallback to request_size
 					if sent, ok := httpMap["bytes_sent"].(float64); ok {
 						dep.BytesSent += int64(sent)
+					} else if sent, ok := httpMap["request_size"].(float64); ok {
+						dep.BytesSent += int64(sent)
+					} else if sent, ok := httpMap["curl_bytes_sent"].(float64); ok {
+						dep.BytesSent += int64(sent)
 					}
+					// Extract bytes received - prefer bytes_received, fallback to response_size
 					if recv, ok := httpMap["bytes_received"].(float64); ok {
+						dep.BytesReceived += int64(recv)
+					} else if recv, ok := httpMap["response_size"].(float64); ok {
+						dep.BytesReceived += int64(recv)
+					} else if recv, ok := httpMap["curl_bytes_received"].(float64); ok {
 						dep.BytesReceived += int64(recv)
 					}
 				}
