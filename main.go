@@ -5128,31 +5128,49 @@ func main() {
 		// Clear in-memory buffer
 		tb.ClearAll()
 		
+		// List of all data tables to purge (excluding configuration tables)
+		dataTables := []string{
+			"spans_min",
+			"spans_full",
+			"traces_full",
+			"network_metrics",
+			"logs",
+			"slow_queries",
+			"query_performance",
+			"rum_events",
+			"response_breakdown",
+			"throughput_metrics",
+			"apdex_scores",
+			"key_transaction_metrics",
+			"external_service_metrics",
+			"custom_metrics",
+			"custom_events",
+			"error_groups",
+			"error_instances",
+			"user_sessions",
+			"user_journeys",
+			"browser_metrics",
+			"infrastructure_metrics",
+			"deployment_impact",
+			"service_dependencies",
+			"service_map_metadata",
+			"service_map_thresholds",
+			"slo_metrics",
+			"anomalies",
+			"alert_history",
+		}
+		
 		// Delete all data from ClickHouse tables
 		errors := make([]string, 0)
 		
-		// Delete from spans_min
-		if err := queryClient.Execute("ALTER TABLE opa.spans_min DELETE WHERE 1=1"); err != nil {
-			LogError(err, "Error purging spans_min", nil)
-			errors = append(errors, fmt.Sprintf("spans_min: %v", err))
-		}
-		
-		// Delete from spans_full
-		if err := queryClient.Execute("ALTER TABLE opa.spans_full DELETE WHERE 1=1"); err != nil {
-			LogError(err, "Error purging spans_full", nil)
-			errors = append(errors, fmt.Sprintf("spans_full: %v", err))
-		}
-		
-		// Delete from traces_full
-		if err := queryClient.Execute("ALTER TABLE opa.traces_full DELETE WHERE 1=1"); err != nil {
-			LogError(err, "Error purging traces_full", nil)
-			errors = append(errors, fmt.Sprintf("traces_full: %v", err))
-		}
-		
-		// Delete from network_metrics
-		if err := queryClient.Execute("ALTER TABLE opa.network_metrics DELETE WHERE 1=1"); err != nil {
-			LogError(err, "Error purging network_metrics", nil)
-			errors = append(errors, fmt.Sprintf("network_metrics: %v", err))
+		for _, table := range dataTables {
+			query := fmt.Sprintf("ALTER TABLE opa.%s DELETE WHERE 1=1", table)
+			if err := queryClient.Execute(query); err != nil {
+				LogError(err, fmt.Sprintf("Error purging %s", table), nil)
+				errors = append(errors, fmt.Sprintf("%s: %v", table, err))
+			} else {
+				LogInfo(fmt.Sprintf("Successfully purged %s", table), nil)
+			}
 		}
 		
 		if len(errors) > 0 {
