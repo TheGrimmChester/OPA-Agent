@@ -1,7 +1,7 @@
 # OpenProfilingAgent API Contract
 
 **Version**: 1.0  
-**Last Updated**: 2024
+**Last Updated**: 2025-12-12
 
 ## Table of Contents
 
@@ -16,8 +16,11 @@
 9. [Data Types and Validation](#data-types-and-validation)
 10. [Implementation Guide](#implementation-guide)
 11. [Examples](#examples)
-12. [Versioning and Compatibility](#versioning-and-compatibility)
-13. [Troubleshooting](#troubleshooting)
+12. [HTTP REST API](#http-rest-api)
+13. [Authentication and Authorization](#authentication-and-authorization)
+14. [WebSocket API](#websocket-api)
+15. [Versioning and Compatibility](#versioning-and-compatibility)
+16. [Troubleshooting](#troubleshooting)
 
 ## Introduction
 
@@ -41,8 +44,11 @@ This contract enables any developer to implement a profiling tool that can send 
 
 This contract covers:
 
-- Three message types: `span`, `error`, and `log`
-- Transport protocols: Unix socket (AF_UNIX) and TCP/IP (AF_INET)
+- **Data Ingestion Protocol**: Three message types (`span`, `error`, and `log`) via Unix socket and TCP/IP
+- **HTTP REST API**: Complete REST API for querying traces, services, metrics, errors, logs, and managing configurations
+- **WebSocket API**: Real-time updates for traces, metrics, and errors
+- **Authentication**: JWT-based authentication and API key management
+- **Multi-Tenancy**: Organization and project-based data isolation
 - Message serialization: ND-JSON format with optional LZ4 compression
 - All nested data structures (SQL queries, HTTP requests, cache operations, Redis operations, call stacks, etc.)
 
@@ -1099,6 +1105,1549 @@ If using compression:
 }
 ```
 
+## HTTP REST API
+
+### Overview
+
+The OpenProfilingAgent provides a comprehensive HTTP REST API for querying traces, services, metrics, errors, logs, and managing configurations. The API is available at the agent's HTTP endpoint (default: `:8080`).
+
+### Base URL
+
+The API base URL depends on your agent configuration:
+- Default: `http://localhost:8080`
+- Production: `https://agent.example.com`
+
+All API endpoints are prefixed with `/api`.
+
+### Authentication
+
+Most endpoints require authentication. See the [Authentication and Authorization](#authentication-and-authorization) section for details.
+
+### Multi-Tenancy
+
+Most endpoints support multi-tenancy through:
+- **Headers**: `X-Organization-ID` and `X-Project-ID`
+- **Query Parameters**: `organization_id` and `project_id`
+- Use `"all"` as value to query across all tenants
+
+### Response Format
+
+All responses are JSON unless otherwise specified. Error responses follow this format:
+
+```json
+{
+  "error": "Error message"
+}
+```
+
+### Endpoints
+
+#### Health and System
+
+**GET /api/health**
+- **Description**: Health check endpoint
+- **Authentication**: None required
+- **Response**: `{"status": "ok"}`
+
+**GET /api/stats**
+- **Description**: Get system statistics
+- **Authentication**: Required
+- **Response**:
+  ```json
+  {
+    "queue_size": 42
+  }
+  ```
+
+#### Authentication
+
+**POST /api/auth/login**
+- **Description**: User login
+- **Authentication**: None required
+- **Request Body**:
+  ```json
+  {
+    "username": "admin",
+    "password": "password123"
+  }
+  ```
+- **Response**:
+  ```json
+  {
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "username": "admin",
+    "role": "admin",
+    "expires": 1704067200
+  }
+  ```
+
+**POST /api/auth/register**
+- **Description**: User registration
+- **Authentication**: None required
+- **Request Body**:
+  ```json
+  {
+    "username": "newuser",
+    "email": "user@example.com",
+    "password": "securepassword",
+    "role": "viewer"
+  }
+  ```
+- **Response**:
+  ```json
+  {
+    "id": "user-123",
+    "username": "newuser",
+    "email": "user@example.com",
+    "role": "viewer"
+  }
+  ```
+
+#### API Keys
+
+**GET /api/api-keys**
+- **Description**: List all API keys for the authenticated user
+- **Authentication**: JWT Bearer token required
+- **Response**:
+  ```json
+  {
+    "api_keys": [
+      {
+        "key_id": "key-123",
+        "name": "Production API Key",
+        "org_id": "org-123",
+        "project_id": "proj-456",
+        "created_at": "2024-01-01T00:00:00Z"
+      }
+    ]
+  }
+  ```
+
+**POST /api/api-keys**
+- **Description**: Create a new API key
+- **Authentication**: JWT Bearer token required
+- **Request Body**:
+  ```json
+  {
+    "name": "Production API Key",
+    "org_id": "org-123",
+    "project_id": "proj-456"
+  }
+  ```
+- **Response**: API key object with `key_hash` (only shown on creation)
+
+**DELETE /api/api-keys/{key_id}**
+- **Description**: Delete an API key
+- **Authentication**: JWT Bearer token required
+
+#### Organizations
+
+**GET /api/organizations**
+- **Description**: List all organizations
+- **Authentication**: Required
+- **Response**:
+  ```json
+  {
+    "organizations": [
+      {
+        "org_id": "org-123",
+        "name": "My Organization",
+        "settings": "{}",
+        "created_at": "2024-01-01T00:00:00Z",
+        "updated_at": "2024-01-01T00:00:00Z"
+      }
+    ]
+  }
+  ```
+
+**POST /api/organizations**
+- **Description**: Create a new organization
+- **Authentication**: JWT Bearer token required
+- **Request Body**:
+  ```json
+  {
+    "name": "My Organization",
+    "settings": "{}"
+  }
+  ```
+
+#### Projects
+
+**GET /api/projects**
+- **Description**: List projects, optionally filtered by organization
+- **Authentication**: Required
+- **Query Parameters**:
+  - `organization_id` (optional): Filter by organization
+- **Response**:
+  ```json
+  {
+    "projects": [
+      {
+        "project_id": "proj-456",
+        "name": "My Project",
+        "org_id": "org-123",
+        "dsn": "https://agent.example.com",
+        "created_at": "2024-01-01T00:00:00Z",
+        "updated_at": "2024-01-01T00:00:00Z"
+      }
+    ]
+  }
+  ```
+
+**POST /api/projects**
+- **Description**: Create a new project
+- **Authentication**: JWT Bearer token required
+- **Request Body**:
+  ```json
+  {
+    "name": "My Project",
+    "org_id": "org-123",
+    "dsn": "https://agent.example.com"
+  }
+  ```
+
+**DELETE /api/projects/{project_id}**
+- **Description**: Delete a project
+- **Authentication**: JWT Bearer token required
+
+#### Traces
+
+**GET /api/traces**
+- **Description**: List traces with filtering, pagination, and sorting
+- **Authentication**: Required
+- **Query Parameters**:
+  - `service` (optional): Filter by service name
+  - `status` (optional): Filter by status (`ok` or `error`)
+  - `language` (optional): Filter by programming language
+  - `framework` (optional): Filter by framework
+  - `from` (optional): Start time (ISO 8601 or ClickHouse format)
+  - `to` (optional): End time
+  - `min_duration` (optional): Minimum duration in milliseconds
+  - `max_duration` (optional): Maximum duration in milliseconds
+  - `scheme` (optional): Filter by URL scheme
+  - `host` (optional): Filter by host
+  - `uri` (optional): Filter by URI path
+  - `sort` (optional): Sort field (`time`, `duration`, `service`), default: `time`
+  - `order` (optional): Sort order (`asc`, `desc`), default: `desc`
+  - `limit` (optional): Maximum number of traces (default: 50, max: 1000)
+  - `offset` (optional): Offset for pagination (default: 0)
+- **Response**:
+  ```json
+  {
+    "traces": [
+      {
+        "trace_id": "trace-123",
+        "service": "api-service",
+        "name": "GET /api/users",
+        "start_ts": "2024-01-01T00:00:00Z",
+        "end_ts": "2024-01-01T00:00:00.125Z",
+        "duration_ms": 125.456,
+        "status": "ok",
+        "span_count": 5,
+        "language": "php",
+        "framework": "symfony"
+      }
+    ],
+    "total": 100,
+    "has_more": true
+  }
+  ```
+
+**GET /api/traces/{trace_id}**
+- **Description**: Get a single trace by ID
+- **Authentication**: Required
+- **Response**: Trace object with spans
+
+**GET /api/traces/{trace_id}/full**
+- **Description**: Get complete trace with all spans and detailed information
+- **Authentication**: Required
+- **Response**: Full trace object with all spans
+
+**GET /api/traces/{trace_id}/logs**
+- **Description**: Get all logs associated with a trace
+- **Authentication**: Required
+- **Query Parameters**:
+  - `limit` (optional): Maximum number of logs (default: 100)
+- **Response**:
+  ```json
+  {
+    "logs": [
+      {
+        "id": "log-123",
+        "trace_id": "trace-123",
+        "span_id": "span-456",
+        "level": "ERROR",
+        "message": "Failed to connect to database",
+        "service": "api-service",
+        "timestamp_ms": 1704067200000,
+        "fields": {
+          "file": "/app/src/Database.php",
+          "line": 50
+        }
+      }
+    ],
+    "count": 5
+  }
+  ```
+
+**DELETE /api/traces/{trace_id}**
+- **Description**: Delete a single trace
+- **Authentication**: Required
+- **Response**:
+  ```json
+  {
+    "status": "deleted",
+    "trace_id": "trace-123"
+  }
+  ```
+
+**POST /api/traces/batch-delete**
+- **Description**: Delete multiple traces
+- **Authentication**: Required
+- **Request Body**:
+  ```json
+  {
+    "trace_ids": ["trace-1", "trace-2", "trace-3"]
+  }
+  ```
+- **Response**:
+  ```json
+  {
+    "status": "completed",
+    "deleted": ["trace-1", "trace-2"],
+    "failed": [
+      {
+        "id": "trace-3",
+        "error": "Trace not found"
+      }
+    ],
+    "deleted_count": 2,
+    "failed_count": 1
+  }
+  ```
+
+#### Services
+
+**GET /api/services**
+- **Description**: Get overview of all services with metrics
+- **Authentication**: Required
+- **Query Parameters**:
+  - `from` (optional): Start time filter
+  - `to` (optional): End time filter
+- **Response**:
+  ```json
+  {
+    "services": [
+      {
+        "service": "api-service",
+        "language": "php",
+        "language_version": "8.4",
+        "framework": "symfony",
+        "framework_version": "7.0",
+        "total_traces": 1000,
+        "total_spans": 5000,
+        "error_count": 50,
+        "error_rate": 1.0,
+        "avg_duration": 125.5,
+        "p95_duration": 250.0,
+        "p99_duration": 500.0,
+        "top_sql_queries": [],
+        "top_endpoints": []
+      }
+    ],
+    "totals": {
+      "total_traces": 10000,
+      "total_spans": 50000,
+      "error_count": 500,
+      "total_cpu_ms": 500000.0,
+      "total_bytes_sent": 10485760,
+      "total_bytes_received": 20971520,
+      "total_http_requests": 2000,
+      "total_sql_queries": 1000,
+      "avg_duration": 125.5
+    }
+  }
+  ```
+
+**GET /api/services/{service}**
+- **Description**: Get detailed information about a specific service
+- **Authentication**: Required
+- **Query Parameters**:
+  - `from` (optional): Start time filter
+  - `to` (optional): End time filter
+- **Response**: Service details with traces
+
+**GET /api/services/metadata**
+- **Description**: Get metadata for all services
+- **Authentication**: Required
+- **Response**:
+  ```json
+  {
+    "services": [
+      {
+        "service": "api-service",
+        "language": "php",
+        "language_version": "8.4",
+        "framework": "symfony",
+        "framework_version": "7.0"
+      }
+    ]
+  }
+  ```
+
+#### Service Map
+
+**GET /api/service-map**
+- **Description**: Get service dependency map showing relationships between services
+- **Authentication**: Required
+- **Query Parameters**:
+  - `from` (optional): Start time filter
+  - `to` (optional): End time filter
+- **Response**:
+  ```json
+  {
+    "nodes": [
+      {
+        "id": "api-service",
+        "name": "API Service",
+        "service": "api-service"
+      }
+    ],
+    "edges": [
+      {
+        "from": "api-service",
+        "to": "db-service",
+        "latency_ms": 10.5,
+        "error_rate": 0.01,
+        "throughput": 1000
+      }
+    ]
+  }
+  ```
+
+**GET /api/service-map/thresholds**
+- **Description**: Get threshold configuration for service map
+- **Authentication**: Required
+- **Response**:
+  ```json
+  {
+    "thresholds": {
+      "latency_ms": 100.0,
+      "error_rate": 0.05,
+      "throughput": 100
+    }
+  }
+  ```
+
+**PUT /api/service-map/thresholds**
+- **Description**: Update threshold configuration for service map
+- **Authentication**: JWT Bearer token required
+- **Request Body**:
+  ```json
+  {
+    "latency_ms": 100.0,
+    "error_rate": 0.05,
+    "throughput": 100
+  }
+  ```
+
+#### Metrics
+
+**GET /api/metrics/network**
+- **Description**: Get network I/O metrics
+- **Authentication**: Required
+- **Query Parameters**:
+  - `from` (optional): Start time filter
+  - `to` (optional): End time filter
+  - `service` (optional): Filter by service
+- **Response**:
+  ```json
+  {
+    "metrics": [
+      {
+        "time": "2024-01-01T00:00:00Z",
+        "service": "api-service",
+        "bytes_sent": 1048576,
+        "bytes_received": 2097152
+      }
+    ]
+  }
+  ```
+
+**GET /api/metrics/performance**
+- **Description**: Get performance metrics including duration, CPU, and throughput
+- **Authentication**: Required
+- **Query Parameters**:
+  - `from` (optional): Start time filter
+  - `to` (optional): End time filter
+  - `service` (optional): Filter by service
+- **Response**:
+  ```json
+  {
+    "metrics": [
+      {
+        "time": "2024-01-01T00:00:00Z",
+        "service": "api-service",
+        "avg_duration": 125.5,
+        "p95_duration": 250.0,
+        "p99_duration": 500.0,
+        "throughput": 1000,
+        "error_rate": 0.01
+      }
+    ]
+  }
+  ```
+
+#### SQL Queries
+
+**GET /api/sql/queries**
+- **Description**: Get list of SQL queries with performance metrics
+- **Authentication**: Required
+- **Query Parameters**:
+  - `from` (optional): Start time filter
+  - `to` (optional): End time filter
+  - `service` (optional): Filter by service
+  - `limit` (optional): Maximum number of queries (default: 50)
+- **Response**:
+  ```json
+  {
+    "queries": [
+      {
+        "fingerprint": "SELECT * FROM users WHERE id = ?",
+        "service": "api-service",
+        "execution_count": 1000,
+        "avg_duration": 10.5,
+        "p95_duration": 20.0,
+        "p99_duration": 50.0,
+        "max_duration": 100.0
+      }
+    ]
+  }
+  ```
+
+**GET /api/sql/queries/{fingerprint}**
+- **Description**: Get detailed information about a specific SQL query by fingerprint
+- **Authentication**: Required
+- **Response**:
+  ```json
+  {
+    "fingerprint": "SELECT * FROM users WHERE id = ?",
+    "service": "api-service",
+    "execution_count": 1000,
+    "avg_duration": 10.5,
+    "p95_duration": 20.0,
+    "p99_duration": 50.0,
+    "max_duration": 100.0,
+    "example_query": "SELECT * FROM users WHERE id = 123",
+    "trends": [
+      {
+        "time": "2024-01-01T00:00:00Z",
+        "avg_duration": 10.5,
+        "p95_duration": 20.0
+      }
+    ]
+  }
+  ```
+
+#### Errors
+
+**GET /api/errors**
+- **Description**: Get list of error groups with counts and details
+- **Authentication**: Required
+- **Query Parameters**:
+  - `from` (optional): Start time filter
+  - `to` (optional): End time filter
+  - `service` (optional): Filter by service
+  - `limit` (optional): Maximum number of errors (default: 50)
+- **Response**:
+  ```json
+  {
+    "errors": [
+      {
+        "error_id": "api-service:Division by zero",
+        "error_message": "Division by zero",
+        "service": "api-service",
+        "count": 10,
+        "first_seen": "2024-01-01T00:00:00Z",
+        "last_seen": "2024-01-01T12:00:00Z"
+      }
+    ]
+  }
+  ```
+
+**GET /api/errors/{error_id}**
+- **Description**: Get detailed information about a specific error
+- **Authentication**: Required
+- **Note**: Error ID format is `{service}:{error_name}`
+- **Response**:
+  ```json
+  {
+    "error_id": "api-service:Division by zero",
+    "error_message": "Division by zero",
+    "service": "api-service",
+    "count": 10,
+    "first_seen": "2024-01-01T00:00:00Z",
+    "last_seen": "2024-01-01T12:00:00Z",
+    "stack_trace": "...",
+    "related_traces": [
+      {
+        "trace_id": "trace-123",
+        "start_ts": "2024-01-01T00:00:00Z"
+      }
+    ],
+    "trends": [
+      {
+        "time": "2024-01-01T00:00:00Z",
+        "count": 5
+      }
+    ]
+  }
+  ```
+
+#### Logs
+
+**GET /api/logs**
+- **Description**: Get log entries with filtering and pagination
+- **Authentication**: Required
+- **Query Parameters**:
+  - `since` (optional): Get logs since this time
+  - `service` (optional): Filter by service
+  - `level` (optional): Filter by log level (`ERROR`, `WARN`, `INFO`, `DEBUG`, `CRITICAL`)
+  - `cursor` (optional): Pagination cursor (timestamp in milliseconds)
+  - `limit` (optional): Maximum number of logs (default: 100, max: 500)
+  - `all` (optional): If set, fetch all historical logs
+- **Response**:
+  ```json
+  {
+    "logs": [
+      {
+        "id": "log-123",
+        "trace_id": "trace-123",
+        "span_id": "span-456",
+        "level": "ERROR",
+        "message": "Failed to connect to database",
+        "service": "api-service",
+        "timestamp_ms": 1704067200000,
+        "fields": {
+          "file": "/app/src/Database.php",
+          "line": 50,
+          "error_code": "DB_CONNECTION_FAILED"
+        }
+      }
+    ],
+    "total": 100,
+    "has_more": true,
+    "next_cursor": 1704067300000
+  }
+  ```
+
+#### RUM (Real User Monitoring)
+
+**GET /api/rum**
+- **Description**: Get Real User Monitoring events
+- **Authentication**: Required
+- **Query Parameters**:
+  - `from` (optional): Start time filter
+  - `to` (optional): End time filter
+- **Response**:
+  ```json
+  {
+    "events": [
+      {
+        "event_id": "event-123",
+        "trace_id": "trace-123",
+        "session_id": "session-456",
+        "event_type": "pageview",
+        "timestamp": 1704067200000,
+        "url": "https://example.com/page",
+        "user_agent": "Mozilla/5.0...",
+        "viewport": {
+          "width": 1920,
+          "height": 1080
+        }
+      }
+    ]
+  }
+  ```
+
+**GET /api/rum/metrics**
+- **Description**: Get Real User Monitoring metrics
+- **Authentication**: Required
+- **Query Parameters**:
+  - `from` (optional): Start time filter
+  - `to` (optional): End time filter
+- **Response**:
+  ```json
+  {
+    "metrics": [
+      {
+        "time": "2024-01-01T00:00:00Z",
+        "page_views": 1000,
+        "unique_visitors": 500,
+        "avg_page_load_time": 1.5,
+        "error_rate": 0.01
+      }
+    ]
+  }
+  ```
+
+#### Key Transactions
+
+**GET /api/key-transactions**
+- **Description**: Get all configured key transactions
+- **Authentication**: Required
+- **Response**:
+  ```json
+  {
+    "transactions": [
+      {
+        "id": "kt-123",
+        "name": "User Login",
+        "service": "api-service",
+        "pattern": "POST /api/auth/login",
+        "created_at": "2024-01-01T00:00:00Z"
+      }
+    ]
+  }
+  ```
+
+**POST /api/key-transactions**
+- **Description**: Create a new key transaction
+- **Authentication**: JWT Bearer token required
+- **Request Body**:
+  ```json
+  {
+    "name": "User Login",
+    "service": "api-service",
+    "pattern": "POST /api/auth/login"
+  }
+  ```
+
+**PUT /api/key-transactions/{id}**
+- **Description**: Update an existing key transaction
+- **Authentication**: JWT Bearer token required
+
+**DELETE /api/key-transactions/{id}**
+- **Description**: Delete a key transaction
+- **Authentication**: JWT Bearer token required
+
+#### SLOs (Service Level Objectives)
+
+**GET /api/slos**
+- **Description**: Get all Service Level Objectives
+- **Authentication**: Required
+- **Response**:
+  ```json
+  {
+    "slos": [
+      {
+        "id": "slo-123",
+        "name": "API Availability",
+        "description": "99.9% uptime target",
+        "service": "api-service",
+        "slo_type": "availability",
+        "target_value": 99.9,
+        "window_hours": 24,
+        "created_at": "2024-01-01T00:00:00Z",
+        "updated_at": "2024-01-01T00:00:00Z"
+      }
+    ]
+  }
+  ```
+
+**POST /api/slos**
+- **Description**: Create a new Service Level Objective
+- **Authentication**: JWT Bearer token required
+- **Request Body**:
+  ```json
+  {
+    "name": "API Availability",
+    "description": "99.9% uptime target",
+    "service": "api-service",
+    "slo_type": "availability",
+    "target_value": 99.9,
+    "window_hours": 24
+  }
+  ```
+
+**PUT /api/slos/{id}**
+- **Description**: Update an existing SLO
+- **Authentication**: JWT Bearer token required
+
+**DELETE /api/slos/{id}**
+- **Description**: Delete a SLO
+- **Authentication**: JWT Bearer token required
+
+**GET /api/slos/{id}/compliance**
+- **Description**: Get compliance metrics for a specific SLO
+- **Authentication**: Required
+- **Response**:
+  ```json
+  {
+    "metrics": [
+      {
+        "actual_value": 99.95,
+        "compliance_percentage": 100.0,
+        "is_breach": false,
+        "window_start": "2024-01-01T00:00:00Z",
+        "window_end": "2024-01-02T00:00:00Z"
+      }
+    ]
+  }
+  ```
+
+#### Dashboards
+
+**GET /api/dashboards**
+- **Description**: Get all dashboards
+- **Authentication**: Required
+- **Response**:
+  ```json
+  {
+    "dashboards": [
+      {
+        "id": "dash-123",
+        "name": "Production Dashboard",
+        "description": "Main production monitoring dashboard",
+        "widgets": [],
+        "created_at": "2024-01-01T00:00:00Z",
+        "updated_at": "2024-01-01T00:00:00Z"
+      }
+    ]
+  }
+  ```
+
+**POST /api/dashboards**
+- **Description**: Create a new dashboard
+- **Authentication**: JWT Bearer token required
+- **Request Body**:
+  ```json
+  {
+    "name": "Production Dashboard",
+    "description": "Main production monitoring dashboard",
+    "widgets": []
+  }
+  ```
+
+**PUT /api/dashboards/{id}**
+- **Description**: Update an existing dashboard
+- **Authentication**: JWT Bearer token required
+
+**DELETE /api/dashboards/{id}**
+- **Description**: Delete a dashboard
+- **Authentication**: JWT Bearer token required
+
+#### Alerts
+
+**GET /api/alerts**
+- **Description**: Get all configured alerts
+- **Authentication**: Required
+- **Response**:
+  ```json
+  {
+    "alerts": [
+      {
+        "id": "alert-123",
+        "name": "High Error Rate",
+        "description": "Alert when error rate exceeds 5%",
+        "service": "api-service",
+        "condition": "error_rate > 5",
+        "threshold": 5.0,
+        "enabled": true,
+        "created_at": "2024-01-01T00:00:00Z"
+      }
+    ]
+  }
+  ```
+
+**POST /api/alerts**
+- **Description**: Create a new alert
+- **Authentication**: JWT Bearer token required
+- **Request Body**:
+  ```json
+  {
+    "name": "High Error Rate",
+    "description": "Alert when error rate exceeds 5%",
+    "service": "api-service",
+    "condition": "error_rate > 5",
+    "threshold": 5.0,
+    "enabled": true
+  }
+  ```
+
+**GET /api/alerts/{id}**
+- **Description**: Get a specific alert by ID
+- **Authentication**: Required
+
+**PUT /api/alerts/{id}**
+- **Description**: Update an existing alert
+- **Authentication**: JWT Bearer token required
+
+**DELETE /api/alerts/{id}**
+- **Description**: Delete an alert
+- **Authentication**: JWT Bearer token required
+
+**POST /api/alerts/{id}**
+- **Description**: Manually trigger an alert check
+- **Authentication**: JWT Bearer token required
+- **Response**:
+  ```json
+  {
+    "status": "checking"
+  }
+  ```
+
+#### Control
+
+**POST /api/control/keep**
+- **Description**: Mark a trace to be kept (not sampled out)
+- **Authentication**: Required
+- **Request Body**:
+  ```json
+  {
+    "trace_id": "trace-123"
+  }
+  ```
+
+**POST /api/control/sampling**
+- **Description**: Set the sampling rate for traces (0.0 to 1.0)
+- **Authentication**: JWT Bearer token required
+- **Request Body**:
+  ```json
+  {
+    "rate": 0.1
+  }
+  ```
+- **Note**: `rate` is a float between 0.0 (0%) and 1.0 (100%)
+
+**DELETE /api/control/purge**
+- **Description**: Delete all traces and data from the system
+- **Authentication**: JWT Bearer token required
+- **Warning**: This operation is irreversible
+
+#### Export
+
+**GET /api/export/traces**
+- **Description**: Export traces in various formats (JSON, CSV, NDJSON)
+- **Authentication**: Required
+- **Query Parameters**:
+  - `format` (optional): Export format (`json`, `csv`, `ndjson`), default: `json`
+  - `from` (optional): Start time filter
+  - `to` (optional): End time filter
+- **Response**: Exported data in the requested format
+- **Content-Type**: 
+  - `application/json` for JSON format
+  - `text/csv` for CSV format
+  - `application/x-ndjson` for NDJSON format
+
+#### Anomalies
+
+**GET /api/anomalies**
+- **Description**: Get detected anomalies
+- **Authentication**: Required
+- **Query Parameters**:
+  - `service` (optional): Filter by service
+  - `severity` (optional): Filter by severity (`low`, `medium`, `high`, `critical`)
+- **Response**:
+  ```json
+  {
+    "anomalies": [
+      {
+        "id": "anom-123",
+        "type": "duration",
+        "service": "api-service",
+        "metric": "avg_duration",
+        "value": 500.0,
+        "expected": 125.0,
+        "score": 0.85,
+        "severity": "high",
+        "detected_at": "2024-01-01T00:00:00Z",
+        "metadata": {}
+      }
+    ]
+  }
+  ```
+
+**POST /api/anomalies/analyze**
+- **Description**: Trigger anomaly detection analysis
+- **Authentication**: JWT Bearer token required
+- **Request Body**:
+  ```json
+  {
+    "service": "api-service",
+    "time_window": 24
+  }
+  ```
+- **Response**: Analysis results with detected anomalies
+
+#### System
+
+**GET /api/languages**
+- **Description**: Get all detected programming languages
+- **Authentication**: Required
+- **Response**:
+  ```json
+  {
+    "languages": ["php", "python", "go"]
+  }
+  ```
+
+**GET /api/frameworks**
+- **Description**: Get all detected frameworks
+- **Authentication**: Required
+- **Response**:
+  ```json
+  {
+    "frameworks": ["symfony", "django", "gin"]
+  }
+  ```
+
+**GET /api/dumps**
+- **Description**: Get variable dumps from traces
+- **Authentication**: Required
+- **Query Parameters**:
+  - `limit` (optional): Maximum number of dumps (default: 100)
+  - `cursor` (optional): Pagination cursor
+- **Response**:
+  ```json
+  {
+    "dumps": [
+      {
+        "id": "dump-123",
+        "trace_id": "trace-123",
+        "span_id": "span-456",
+        "service": "api-service",
+        "span_name": "getUser",
+        "timestamp": 1704067200000,
+        "file": "/app/src/Repository/UserRepository.php",
+        "line": 42,
+        "data": {},
+        "text": "Variable dump text"
+      }
+    ],
+    "total": 100,
+    "has_more": true,
+    "next_cursor": 1704067300000
+  }
+  ```
+
+### Error Responses
+
+All endpoints may return the following HTTP status codes:
+
+- **200 OK**: Request successful
+- **201 Created**: Resource created successfully
+- **204 No Content**: Request successful, no response body
+- **400 Bad Request**: Invalid request parameters or body
+- **401 Unauthorized**: Authentication required or invalid
+- **403 Forbidden**: Insufficient permissions
+- **404 Not Found**: Resource not found
+- **405 Method Not Allowed**: HTTP method not supported
+- **500 Internal Server Error**: Server error
+
+Error responses follow this format:
+
+```json
+{
+  "error": "Error message description"
+}
+```
+
+## Authentication and Authorization
+
+### Overview
+
+The OpenProfilingAgent API supports two authentication methods:
+
+1. **JWT Bearer Token**: For user-based authentication
+2. **API Key**: For programmatic access
+
+### JWT Bearer Authentication
+
+JWT (JSON Web Token) authentication is used for user-based access to the API.
+
+#### Obtaining a JWT Token
+
+Use the `/api/auth/login` endpoint to obtain a JWT token:
+
+```bash
+curl -X POST http://localhost:8080/api/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "admin",
+    "password": "password123"
+  }'
+```
+
+Response:
+```json
+{
+  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "username": "admin",
+  "role": "admin",
+  "expires": 1704067200
+}
+```
+
+#### Using JWT Tokens
+
+Include the JWT token in the `Authorization` header:
+
+```bash
+curl -X GET http://localhost:8080/api/traces \
+  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+```
+
+#### Token Expiration
+
+JWT tokens expire after 24 hours. When a token expires, you will receive a `401 Unauthorized` response. Obtain a new token by logging in again.
+
+#### User Registration
+
+New users can be registered via the `/api/auth/register` endpoint:
+
+```bash
+curl -X POST http://localhost:8080/api/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "username": "newuser",
+    "email": "user@example.com",
+    "password": "securepassword",
+    "role": "viewer"
+  }'
+```
+
+**Roles**:
+- `viewer`: Read-only access
+- `editor`: Read and write access
+- `admin`: Full access including system configuration
+
+### API Key Authentication
+
+API keys provide programmatic access without user credentials. They are scoped to specific organizations and projects.
+
+#### Creating an API Key
+
+API keys can be created via the `/api/api-keys` endpoint (requires JWT authentication):
+
+```bash
+curl -X POST http://localhost:8080/api/api-keys \
+  -H "Authorization: Bearer {jwt_token}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Production API Key",
+    "org_id": "org-123",
+    "project_id": "proj-456"
+  }'
+```
+
+Response includes the `key_hash` (only shown on creation):
+```json
+{
+  "key_id": "key-123",
+  "name": "Production API Key",
+  "org_id": "org-123",
+  "project_id": "proj-456",
+  "key_hash": "abc123def456...",
+  "created_at": "2024-01-01T00:00:00Z"
+}
+```
+
+#### Using API Keys
+
+API keys can be used in two formats:
+
+**Format 1: Organization:Project:KeyHash**
+```bash
+curl -X GET http://localhost:8080/api/traces \
+  -H "Authorization: org-123:proj-456:abc123def456..."
+```
+
+**Format 2: DSN (Data Source Name)**
+If a project has a DSN configured, you can use it directly:
+```bash
+curl -X GET http://localhost:8080/api/traces \
+  -H "Authorization: https://agent.example.com"
+```
+
+The agent will look up the organization and project associated with the DSN.
+
+### Multi-Tenancy
+
+The agent supports multi-tenant data isolation through organizations and projects.
+
+#### Tenant Context Extraction
+
+The agent extracts tenant context from requests in the following order of precedence:
+
+1. **DSN-based authentication**: If `Authorization` header contains a DSN (starts with `http://` or `https://`), the agent queries the projects table to find the associated organization and project.
+
+2. **API Key format**: If `Authorization` header contains `{org_id}:{project_id}:{key_hash}`, the agent verifies the API key and uses the associated organization and project.
+
+3. **Headers**: `X-Organization-ID` and `X-Project-ID` headers
+   ```bash
+   curl -X GET http://localhost:8080/api/traces \
+     -H "X-Organization-ID: org-123" \
+     -H "X-Project-ID: proj-456"
+   ```
+
+4. **Query Parameters**: `organization_id` and `project_id` query parameters
+   ```bash
+   curl -X GET "http://localhost:8080/api/traces?organization_id=org-123&project_id=proj-456"
+   ```
+
+#### Querying All Tenants
+
+To query across all tenants, use `"all"` as the value:
+```bash
+curl -X GET "http://localhost:8080/api/traces?organization_id=all"
+```
+
+#### Default Tenants
+
+If no tenant context is provided, the agent uses:
+- `organization_id`: `"default-org"`
+- `project_id`: `"default-project"`
+
+### Role-Based Access Control
+
+The agent implements role-based access control (RBAC) with three roles:
+
+- **viewer** (Level 1): Read-only access to all endpoints
+- **editor** (Level 2): Read and write access, can create/update/delete resources
+- **admin** (Level 3): Full access including system configuration and control endpoints
+
+Users with higher-level roles have access to all lower-level permissions. For example, an `admin` can perform all operations available to `editor` and `viewer`.
+
+Some endpoints require specific roles:
+- Control endpoints (`/api/control/*`) typically require `admin` role
+- Write operations (POST, PUT, DELETE) typically require `editor` or `admin` role
+- Read operations (GET) are available to all authenticated users
+
+## WebSocket API
+
+### Overview
+
+The OpenProfilingAgent provides a WebSocket endpoint for real-time updates. This enables clients to receive live notifications about traces, metrics, and errors without polling.
+
+### Connection
+
+**Endpoint**: `/ws`
+
+**Protocol**: WebSocket (RFC 6455)
+
+**URL Format**:
+- Local: `ws://localhost:8082/ws`
+- Production: `wss://agent.example.com/ws` (secure WebSocket)
+
+### Connection Establishment
+
+Clients connect to the WebSocket endpoint using standard WebSocket handshake:
+
+```javascript
+const ws = new WebSocket('ws://localhost:8082/ws');
+
+ws.onopen = () => {
+  console.log('WebSocket connected');
+};
+
+ws.onmessage = (event) => {
+  const message = JSON.parse(event.data);
+  console.log('Received:', message);
+};
+
+ws.onerror = (error) => {
+  console.error('WebSocket error:', error);
+};
+
+ws.onclose = () => {
+  console.log('WebSocket disconnected');
+};
+```
+
+### Message Format
+
+All messages from the server follow this format:
+
+```json
+{
+  "channel": "traces",
+  "data": {
+    "trace_id": "trace-123",
+    "service": "api-service"
+  },
+  "timestamp": 1704067200
+}
+```
+
+**Fields**:
+- `channel` (string): The channel name (`traces`, `metrics`, or `errors`)
+- `data` (object): The message payload (structure varies by channel)
+- `timestamp` (integer): Unix timestamp in seconds
+
+### Channels
+
+Clients automatically subscribe to all available channels upon connection:
+
+- **traces**: Real-time trace updates
+- **metrics**: Performance and system metrics
+- **errors**: Error notifications
+
+Currently, clients cannot selectively subscribe to specific channels. All connected clients receive all channel broadcasts.
+
+### Keepalive
+
+The server implements a keepalive mechanism to maintain connections:
+
+- **Ping Interval**: Server sends ping messages every 54 seconds
+- **Pong Response**: Clients should respond to ping messages with pong
+- **Read Timeout**: 60 seconds (connection closes if no pong received)
+- **Write Timeout**: 10 seconds
+
+**Client Implementation** (JavaScript example):
+
+```javascript
+ws.on('pong', () => {
+  // Pong received, connection is alive
+});
+
+// Send pong in response to ping
+ws.on('ping', () => {
+  ws.pong();
+});
+```
+
+### Message Broadcasting
+
+The server broadcasts messages to all connected clients. Messages are sent as JSON-encoded text frames.
+
+**Example Trace Update**:
+```json
+{
+  "channel": "traces",
+  "data": {
+    "trace_id": "trace-123",
+    "service": "api-service",
+    "name": "GET /api/users",
+    "status": "ok",
+    "duration_ms": 125.456
+  },
+  "timestamp": 1704067200
+}
+```
+
+**Example Metrics Update**:
+```json
+{
+  "channel": "metrics",
+  "data": {
+    "service": "api-service",
+    "avg_duration": 125.5,
+    "error_rate": 0.01,
+    "throughput": 1000
+  },
+  "timestamp": 1704067200
+}
+```
+
+**Example Error Notification**:
+```json
+{
+  "channel": "errors",
+  "data": {
+    "error_id": "api-service:Division by zero",
+    "error_message": "Division by zero",
+    "service": "api-service",
+    "count": 5
+  },
+  "timestamp": 1704067200
+}
+```
+
+### Client Read Pump
+
+Clients should implement a read pump to handle incoming messages:
+
+```javascript
+function readPump(ws) {
+  ws.on('message', (data) => {
+    try {
+      const message = JSON.parse(data.toString());
+      handleMessage(message);
+    } catch (error) {
+      console.error('Failed to parse message:', error);
+    }
+  });
+}
+```
+
+### Client Write Pump
+
+The server handles message batching. If multiple messages are queued, they are sent in a single write operation separated by newlines:
+
+```
+{"channel":"traces","data":{...},"timestamp":1704067200}\n
+{"channel":"metrics","data":{...},"timestamp":1704067201}\n
+```
+
+### Connection Lifecycle
+
+1. **Connect**: Client establishes WebSocket connection
+2. **Register**: Server registers client and subscribes to all channels
+3. **Receive**: Client receives broadcasts for all channels
+4. **Keepalive**: Server sends pings, client responds with pongs
+5. **Disconnect**: Connection closes on error, timeout, or explicit close
+
+### Error Handling
+
+**Connection Errors**:
+- Network errors: Client should implement reconnection logic with exponential backoff
+- Authentication errors: WebSocket connections do not currently require authentication (may change in future versions)
+- Server errors: Server logs errors and may close the connection
+
+**Message Errors**:
+- Invalid JSON: Client should log and ignore malformed messages
+- Unknown channels: Client should ignore messages from unknown channels
+
+### Example Client Implementation
+
+**JavaScript (Browser)**:
+```javascript
+class OPAWebSocketClient {
+  constructor(url) {
+    this.url = url;
+    this.ws = null;
+    this.reconnectDelay = 1000;
+    this.maxReconnectDelay = 30000;
+  }
+
+  connect() {
+    this.ws = new WebSocket(this.url);
+
+    this.ws.onopen = () => {
+      console.log('Connected to OpenProfilingAgent WebSocket');
+      this.reconnectDelay = 1000;
+    };
+
+    this.ws.onmessage = (event) => {
+      const message = JSON.parse(event.data);
+      this.handleMessage(message);
+    };
+
+    this.ws.onerror = (error) => {
+      console.error('WebSocket error:', error);
+    };
+
+    this.ws.onclose = () => {
+      console.log('WebSocket closed, reconnecting...');
+      this.reconnect();
+    };
+
+    // Handle ping/pong
+    this.ws.on('ping', () => {
+      this.ws.pong();
+    });
+  }
+
+  handleMessage(message) {
+    switch (message.channel) {
+      case 'traces':
+        this.onTraceUpdate(message.data);
+        break;
+      case 'metrics':
+        this.onMetricsUpdate(message.data);
+        break;
+      case 'errors':
+        this.onErrorNotification(message.data);
+        break;
+    }
+  }
+
+  onTraceUpdate(data) {
+    console.log('Trace update:', data);
+  }
+
+  onMetricsUpdate(data) {
+    console.log('Metrics update:', data);
+  }
+
+  onErrorNotification(data) {
+    console.log('Error notification:', data);
+  }
+
+  reconnect() {
+    setTimeout(() => {
+      this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.maxReconnectDelay);
+      this.connect();
+    }, this.reconnectDelay);
+  }
+
+  close() {
+    if (this.ws) {
+      this.ws.close();
+    }
+  }
+}
+
+// Usage
+const client = new OPAWebSocketClient('ws://localhost:8082/ws');
+client.connect();
+```
+
+**Python Example**:
+```python
+import asyncio
+import websockets
+import json
+
+async def opa_websocket_client():
+    uri = "ws://localhost:8082/ws"
+    
+    async with websockets.connect(uri) as websocket:
+        print("Connected to OpenProfilingAgent WebSocket")
+        
+        while True:
+            try:
+                message = await websocket.recv()
+                data = json.loads(message)
+                
+                channel = data.get("channel")
+                payload = data.get("data")
+                
+                if channel == "traces":
+                    print(f"Trace update: {payload}")
+                elif channel == "metrics":
+                    print(f"Metrics update: {payload}")
+                elif channel == "errors":
+                    print(f"Error notification: {payload}")
+                    
+            except websockets.exceptions.ConnectionClosed:
+                print("WebSocket connection closed")
+                break
+            except Exception as e:
+                print(f"Error: {e}")
+
+# Run client
+asyncio.run(opa_websocket_client())
+```
+
+### Limitations
+
+- **No Authentication**: WebSocket connections currently do not require authentication (may be added in future versions)
+- **No Selective Subscription**: Clients receive all channel broadcasts (selective subscription may be added in future versions)
+- **No Message Acknowledgment**: Messages are fire-and-forget (no delivery confirmation)
+- **No Message History**: Clients only receive messages sent after connection (no replay of historical messages)
+
+### Future Enhancements
+
+Potential future enhancements to the WebSocket API:
+
+- Authentication support (JWT tokens or API keys)
+- Selective channel subscription
+- Message acknowledgment and delivery confirmation
+- Message history replay
+- Client-to-server commands (e.g., subscribe/unsubscribe)
+
 ## Versioning and Compatibility
 
 ### Protocol Version
@@ -1197,5 +2746,5 @@ echo '{"type":"span","trace_id":"test","span_id":"test","service":"test","name":
 
 **Document Status**: Stable  
 **Maintained By**: OpenProfilingAgent Team  
-**Last Review**: 2024
+**Last Review**: 2025-12-12
 

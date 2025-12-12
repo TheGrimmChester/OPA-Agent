@@ -1,0 +1,3476 @@
+openapi: 3.0.3
+info:
+  title: OpenProfilingAgent API
+  description: |
+    Complete REST API documentation for OpenProfilingAgent - a distributed tracing and performance monitoring system.
+    
+    The API provides endpoints for:
+    - Authentication and authorization
+    - Multi-tenant organization and project management
+    - Trace and span querying
+    - Service metrics and monitoring
+    - Error tracking and log aggregation
+    - Real User Monitoring (RUM)
+    - Alerting and SLO management
+    - Dashboard configuration
+    - Anomaly detection
+    
+    ## Authentication
+    
+    The API supports two authentication methods:
+    
+    1. **JWT Bearer Token**: Use the token returned from `/api/auth/login` in the `Authorization` header as `Bearer {token}`
+    2. **API Key**: Use API key in format `{org_id}:{project_id}:{key_hash}` or DSN in the `Authorization` header
+    
+    ## Multi-Tenancy
+    
+    Most endpoints support multi-tenancy through:
+    - Headers: `X-Organization-ID` and `X-Project-ID`
+    - Query parameters: `organization_id` and `project_id`
+    - Use `"all"` as value to query across all tenants
+    
+    ## WebSocket
+    
+    Real-time updates are available via WebSocket at `/ws`. The WebSocket endpoint provides:
+    
+    - **Connection**: Connect to `ws://host:port/ws` (or `wss://` for secure connections)
+    - **Message Format**: JSON messages with `channel`, `data`, and `timestamp` fields
+    - **Channels**: Clients automatically subscribe to `traces`, `metrics`, and `errors` channels
+    - **Keepalive**: Server sends ping messages every 54 seconds, clients should respond with pong
+    - **Message Example**:
+      ```json
+      {
+        "channel": "traces",
+        "data": { "trace_id": "trace-123", "service": "api-service" },
+        "timestamp": 1704067200
+      }
+      ```
+    
+    Note: OpenAPI 3.0 doesn't fully support WebSocket specifications. For detailed WebSocket API documentation, refer to the agent source code or WebSocket implementation documentation.
+  version: 1.0.0
+  contact:
+    name: OpenProfilingAgent Team
+  license:
+    name: MIT
+
+servers:
+  - url: http://localhost:9090
+    description: Local development server
+  - url: https://agent.example.com
+    description: Production server (example)
+
+tags:
+  - name: Authentication
+    description: User authentication and registration
+  - name: API Keys
+    description: API key management
+  - name: Organizations
+    description: Organization management
+  - name: Projects
+    description: Project management
+  - name: Traces
+    description: Trace and span querying
+  - name: Services
+    description: Service metrics and metadata
+  - name: Service Map
+    description: Service dependency mapping
+  - name: Metrics
+    description: Performance and network metrics
+  - name: SQL Queries
+    description: SQL query analysis
+  - name: Errors
+    description: Error tracking and analysis
+  - name: Logs
+    description: Log aggregation and querying
+  - name: RUM
+    description: Real User Monitoring
+  - name: Key Transactions
+    description: Key transaction monitoring
+  - name: SLOs
+    description: Service Level Objectives
+  - name: Dashboards
+    description: Dashboard configuration
+  - name: Alerts
+    description: Alert configuration and management
+  - name: Control
+    description: Agent control operations
+  - name: Export
+    description: Data export functionality
+  - name: Anomalies
+    description: Anomaly detection
+  - name: System
+    description: System health and statistics
+
+paths:
+  /api/health:
+    get:
+      tags:
+        - System
+      summary: Health check
+      description: Returns the health status of the agent
+      operationId: healthCheck
+      responses:
+        '200':
+          description: Agent is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+              example:
+                status: ok
+
+  /api/stats:
+    get:
+      tags:
+        - System
+      summary: Get system statistics
+      description: Returns current system statistics including queue size
+      operationId: getStats
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      responses:
+        '200':
+          description: System statistics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  queue_size:
+                    type: integer
+                    description: Current queue size
+                    example: 42
+
+  /api/auth/login:
+    post:
+      tags:
+        - Authentication
+      summary: User login
+      description: Authenticate user and receive JWT token
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - username
+                - password
+              properties:
+                username:
+                  type: string
+                  example: admin
+                password:
+                  type: string
+                  format: password
+                  example: password123
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/auth/register:
+    post:
+      tags:
+        - Authentication
+      summary: User registration
+      description: Register a new user account
+      operationId: register
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - username
+                - email
+                - password
+              properties:
+                username:
+                  type: string
+                  example: newuser
+                email:
+                  type: string
+                  format: email
+                  example: user@example.com
+                password:
+                  type: string
+                  format: password
+                  example: securepassword
+                role:
+                  type: string
+                  enum: [viewer, editor, admin]
+                  default: viewer
+                  example: viewer
+      responses:
+        '200':
+          description: Registration successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /api/api-keys:
+    get:
+      tags:
+        - API Keys
+      summary: List API keys
+      description: Get all API keys for the authenticated user
+      operationId: listAPIKeys
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: List of API keys
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  api_keys:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/APIKey'
+    post:
+      tags:
+        - API Keys
+      summary: Create API key
+      description: Create a new API key
+      operationId: createAPIKey
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                  example: Production API Key
+                org_id:
+                  type: string
+                  example: org-123
+                project_id:
+                  type: string
+                  example: proj-456
+      responses:
+        '200':
+          description: API key created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/APIKey'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /api/api-keys/{key_id}:
+    delete:
+      tags:
+        - API Keys
+      summary: Delete API key
+      description: Delete an API key by ID
+      operationId: deleteAPIKey
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/KeyId'
+      responses:
+        '204':
+          description: API key deleted
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/organizations:
+    get:
+      tags:
+        - Organizations
+      summary: List organizations
+      description: Get all organizations
+      operationId: listOrganizations
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/OrganizationIdHeader'
+        - $ref: '#/components/parameters/OrganizationIdQuery'
+      responses:
+        '200':
+          description: List of organizations
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  organizations:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Organization'
+    post:
+      tags:
+        - Organizations
+      summary: Create organization
+      description: Create a new organization
+      operationId: createOrganization
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+              properties:
+                name:
+                  type: string
+                  example: My Organization
+                settings:
+                  type: string
+                  example: '{}'
+      responses:
+        '200':
+          description: Organization created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Organization'
+
+  /api/projects:
+    get:
+      tags:
+        - Projects
+      summary: List projects
+      description: Get all projects, optionally filtered by organization
+      operationId: listProjects
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/OrganizationIdHeader'
+        - $ref: '#/components/parameters/OrganizationIdQuery'
+        - $ref: '#/components/parameters/ProjectIdHeader'
+        - $ref: '#/components/parameters/ProjectIdQuery'
+      responses:
+        '200':
+          description: List of projects
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  projects:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Project'
+    post:
+      tags:
+        - Projects
+      summary: Create project
+      description: Create a new project
+      operationId: createProject
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - name
+                - org_id
+              properties:
+                name:
+                  type: string
+                  example: My Project
+                org_id:
+                  type: string
+                  example: org-123
+                dsn:
+                  type: string
+                  example: https://agent.example.com
+      responses:
+        '200':
+          description: Project created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Project'
+
+  /api/projects/{project_id}:
+    delete:
+      tags:
+        - Projects
+      summary: Delete project
+      description: Delete a project by ID
+      operationId: deleteProject
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ProjectIdPath'
+      responses:
+        '204':
+          description: Project deleted
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/traces:
+    get:
+      tags:
+        - Traces
+      summary: List traces
+      description: Get traces with filtering, pagination, and sorting
+      operationId: listTraces
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/OrganizationIdHeader'
+        - $ref: '#/components/parameters/OrganizationIdQuery'
+        - $ref: '#/components/parameters/ProjectIdHeader'
+        - $ref: '#/components/parameters/ProjectIdQuery'
+        - name: service
+          in: query
+          schema:
+            type: string
+          description: Filter by service name
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [ok, error]
+          description: Filter by status
+        - name: language
+          in: query
+          schema:
+            type: string
+          description: Filter by programming language
+        - name: framework
+          in: query
+          schema:
+            type: string
+          description: Filter by framework
+        - name: version
+          in: query
+          schema:
+            type: string
+          description: Filter by version
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Start time (ISO 8601 or ClickHouse format)
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: End time (ISO 8601 or ClickHouse format)
+        - name: min_duration
+          in: query
+          schema:
+            type: number
+          description: Minimum duration in milliseconds
+        - name: max_duration
+          in: query
+          schema:
+            type: number
+          description: Maximum duration in milliseconds
+        - name: scheme
+          in: query
+          schema:
+            type: string
+          description: Filter by URL scheme
+        - name: host
+          in: query
+          schema:
+            type: string
+          description: Filter by host
+        - name: uri
+          in: query
+          schema:
+            type: string
+          description: Filter by URI path
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [time, duration, service]
+            default: time
+          description: Sort field
+        - name: order
+          in: query
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
+          description: Sort order
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+            maximum: 1000
+          description: Maximum number of traces to return
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+          description: Offset for pagination
+      responses:
+        '200':
+          description: List of traces
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  traces:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TraceSummary'
+                  total:
+                    type: integer
+                  has_more:
+                    type: boolean
+
+  /api/traces/batch-delete:
+    post:
+      tags:
+        - Traces
+      summary: Batch delete traces
+      description: Delete multiple traces by their IDs
+      operationId: batchDeleteTraces
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/OrganizationIdHeader'
+        - $ref: '#/components/parameters/OrganizationIdQuery'
+        - $ref: '#/components/parameters/ProjectIdHeader'
+        - $ref: '#/components/parameters/ProjectIdQuery'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - trace_ids
+              properties:
+                trace_ids:
+                  type: array
+                  items:
+                    type: string
+                  example: ["trace-1", "trace-2"]
+      responses:
+        '200':
+          description: Batch delete result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: completed
+                  deleted:
+                    type: array
+                    items:
+                      type: string
+                  failed:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        error:
+                          type: string
+                  deleted_count:
+                    type: integer
+                  failed_count:
+                    type: integer
+
+  /api/traces/{trace_id}:
+    get:
+      tags:
+        - Traces
+      summary: Get trace details
+      description: Get a single trace by ID
+      operationId: getTrace
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TraceId'
+        - $ref: '#/components/parameters/OrganizationIdHeader'
+        - $ref: '#/components/parameters/OrganizationIdQuery'
+        - $ref: '#/components/parameters/ProjectIdHeader'
+        - $ref: '#/components/parameters/ProjectIdQuery'
+      responses:
+        '200':
+          description: Trace details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Trace'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags:
+        - Traces
+      summary: Delete trace
+      description: Delete a single trace by ID
+      operationId: deleteTrace
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TraceId'
+        - $ref: '#/components/parameters/OrganizationIdHeader'
+        - $ref: '#/components/parameters/OrganizationIdQuery'
+        - $ref: '#/components/parameters/ProjectIdHeader'
+        - $ref: '#/components/parameters/ProjectIdQuery'
+      responses:
+        '200':
+          description: Trace deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: deleted
+                  trace_id:
+                    type: string
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/traces/{trace_id}/full:
+    get:
+      tags:
+        - Traces
+      summary: Get full trace
+      description: Get complete trace with all spans and detailed information
+      operationId: getFullTrace
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TraceId'
+        - $ref: '#/components/parameters/OrganizationIdHeader'
+        - $ref: '#/components/parameters/OrganizationIdQuery'
+        - $ref: '#/components/parameters/ProjectIdHeader'
+        - $ref: '#/components/parameters/ProjectIdQuery'
+      responses:
+        '200':
+          description: Full trace with all spans
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Trace'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/traces/{trace_id}/logs:
+    get:
+      tags:
+        - Traces
+      summary: Get logs for trace
+      description: Get all logs associated with a trace
+      operationId: getTraceLogs
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/TraceId'
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+          description: Maximum number of logs to return
+      responses:
+        '200':
+          description: List of logs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  logs:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/LogEntry'
+                  count:
+                    type: integer
+
+  /api/services:
+    get:
+      tags:
+        - Services
+      summary: List services
+      description: Get overview of all services with metrics
+      operationId: listServices
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/OrganizationIdHeader'
+        - $ref: '#/components/parameters/OrganizationIdQuery'
+        - $ref: '#/components/parameters/ProjectIdHeader'
+        - $ref: '#/components/parameters/ProjectIdQuery'
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Start time filter
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: End time filter
+      responses:
+        '200':
+          description: List of services with metrics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  services:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Service'
+                  totals:
+                    $ref: '#/components/schemas/ServiceTotals'
+
+  /api/services/{service}:
+    get:
+      tags:
+        - Services
+      summary: Get service details
+      description: Get detailed information about a specific service
+      operationId: getService
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - name: service
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Service name
+        - $ref: '#/components/parameters/OrganizationIdHeader'
+        - $ref: '#/components/parameters/OrganizationIdQuery'
+        - $ref: '#/components/parameters/ProjectIdHeader'
+        - $ref: '#/components/parameters/ProjectIdQuery'
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Start time filter
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: End time filter
+      responses:
+        '200':
+          description: Service details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServiceDetails'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/services/metadata:
+    get:
+      tags:
+        - Services
+      summary: Get service metadata
+      description: Get metadata for all services
+      operationId: getServiceMetadata
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/OrganizationIdHeader'
+        - $ref: '#/components/parameters/OrganizationIdQuery'
+        - $ref: '#/components/parameters/ProjectIdHeader'
+        - $ref: '#/components/parameters/ProjectIdQuery'
+      responses:
+        '200':
+          description: Service metadata
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  services:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ServiceMetadata'
+
+  /api/service-map:
+    get:
+      tags:
+        - Service Map
+      summary: Get service map
+      description: Get service dependency map showing relationships between services
+      operationId: getServiceMap
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/OrganizationIdHeader'
+        - $ref: '#/components/parameters/OrganizationIdQuery'
+        - $ref: '#/components/parameters/ProjectIdHeader'
+        - $ref: '#/components/parameters/ProjectIdQuery'
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Start time filter
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: End time filter
+      responses:
+        '200':
+          description: Service map data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServiceMap'
+
+  /api/service-map/thresholds:
+    get:
+      tags:
+        - Service Map
+      summary: Get service map thresholds
+      description: Get threshold configuration for service map
+      operationId: getServiceMapThresholds
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      responses:
+        '200':
+          description: Threshold configuration
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  thresholds:
+                    type: object
+                    properties:
+                      latency_ms:
+                        type: number
+                      error_rate:
+                        type: number
+                      throughput:
+                        type: number
+    put:
+      tags:
+        - Service Map
+      summary: Update service map thresholds
+      description: Update threshold configuration for service map
+      operationId: updateServiceMapThresholds
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                latency_ms:
+                  type: number
+                error_rate:
+                  type: number
+                throughput:
+                  type: number
+      responses:
+        '200':
+          description: Thresholds updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: updated
+
+  /api/metrics/network:
+    get:
+      tags:
+        - Metrics
+      summary: Get network metrics
+      description: Get network I/O metrics
+      operationId: getNetworkMetrics
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/OrganizationIdHeader'
+        - $ref: '#/components/parameters/OrganizationIdQuery'
+        - $ref: '#/components/parameters/ProjectIdHeader'
+        - $ref: '#/components/parameters/ProjectIdQuery'
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Start time filter
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: End time filter
+        - name: service
+          in: query
+          schema:
+            type: string
+          description: Filter by service
+      responses:
+        '200':
+          description: Network metrics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  metrics:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/NetworkMetric'
+
+  /api/metrics/performance:
+    get:
+      tags:
+        - Metrics
+      summary: Get performance metrics
+      description: Get performance metrics including duration, CPU, and throughput
+      operationId: getPerformanceMetrics
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/OrganizationIdHeader'
+        - $ref: '#/components/parameters/OrganizationIdQuery'
+        - $ref: '#/components/parameters/ProjectIdHeader'
+        - $ref: '#/components/parameters/ProjectIdQuery'
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Start time filter
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: End time filter
+        - name: service
+          in: query
+          schema:
+            type: string
+          description: Filter by service
+      responses:
+        '200':
+          description: Performance metrics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  metrics:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PerformanceMetric'
+
+  /api/sql/queries:
+    get:
+      tags:
+        - SQL Queries
+      summary: List SQL queries
+      description: Get list of SQL queries with performance metrics
+      operationId: listSQLQueries
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/OrganizationIdHeader'
+        - $ref: '#/components/parameters/OrganizationIdQuery'
+        - $ref: '#/components/parameters/ProjectIdHeader'
+        - $ref: '#/components/parameters/ProjectIdQuery'
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Start time filter
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: End time filter
+        - name: service
+          in: query
+          schema:
+            type: string
+          description: Filter by service
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+          description: Maximum number of queries to return
+      responses:
+        '200':
+          description: List of SQL queries
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  queries:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SQLQuerySummary'
+
+  /api/sql/queries/{fingerprint}:
+    get:
+      tags:
+        - SQL Queries
+      summary: Get SQL query details
+      description: Get detailed information about a specific SQL query by fingerprint
+      operationId: getSQLQuery
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - name: fingerprint
+          in: path
+          required: true
+          schema:
+            type: string
+          description: SQL query fingerprint
+        - $ref: '#/components/parameters/OrganizationIdHeader'
+        - $ref: '#/components/parameters/OrganizationIdQuery'
+        - $ref: '#/components/parameters/ProjectIdHeader'
+        - $ref: '#/components/parameters/ProjectIdQuery'
+      responses:
+        '200':
+          description: SQL query details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SQLQueryDetails'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/errors:
+    get:
+      tags:
+        - Errors
+      summary: List errors
+      description: Get list of error groups with counts and details
+      operationId: listErrors
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/OrganizationIdHeader'
+        - $ref: '#/components/parameters/OrganizationIdQuery'
+        - $ref: '#/components/parameters/ProjectIdHeader'
+        - $ref: '#/components/parameters/ProjectIdQuery'
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Start time filter
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: End time filter
+        - name: service
+          in: query
+          schema:
+            type: string
+          description: Filter by service
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+          description: Maximum number of errors to return
+      responses:
+        '200':
+          description: List of errors
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  errors:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ErrorGroup'
+
+  /api/errors/{error_id}:
+    get:
+      tags:
+        - Errors
+      summary: Get error details
+      description: Get detailed information about a specific error
+      operationId: getError
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - name: error_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Error ID (format: service:error_name)
+        - $ref: '#/components/parameters/OrganizationIdHeader'
+        - $ref: '#/components/parameters/OrganizationIdQuery'
+        - $ref: '#/components/parameters/ProjectIdHeader'
+        - $ref: '#/components/parameters/ProjectIdQuery'
+      responses:
+        '200':
+          description: Error details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorDetails'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/logs:
+    get:
+      tags:
+        - Logs
+      summary: List logs
+      description: Get log entries with filtering and pagination
+      operationId: listLogs
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/OrganizationIdHeader'
+        - $ref: '#/components/parameters/OrganizationIdQuery'
+        - $ref: '#/components/parameters/ProjectIdHeader'
+        - $ref: '#/components/parameters/ProjectIdQuery'
+        - name: since
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Get logs since this time
+        - name: service
+          in: query
+          schema:
+            type: string
+          description: Filter by service
+        - name: level
+          in: query
+          schema:
+            type: string
+            enum: [ERROR, WARN, INFO, DEBUG, CRITICAL]
+          description: Filter by log level
+        - name: cursor
+          in: query
+          schema:
+            type: integer
+          description: Pagination cursor (timestamp in milliseconds)
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+            maximum: 500
+          description: Maximum number of logs to return
+        - name: all
+          in: query
+          schema:
+            type: string
+          description: If set, fetch all historical logs
+      responses:
+        '200':
+          description: List of logs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  logs:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/LogEntry'
+                  total:
+                    type: integer
+                  has_more:
+                    type: boolean
+                  next_cursor:
+                    type: integer
+
+  /api/rum:
+    get:
+      tags:
+        - RUM
+      summary: Get RUM events
+      description: Get Real User Monitoring events
+      operationId: getRUMEvents
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/OrganizationIdHeader'
+        - $ref: '#/components/parameters/OrganizationIdQuery'
+        - $ref: '#/components/parameters/ProjectIdHeader'
+        - $ref: '#/components/parameters/ProjectIdQuery'
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Start time filter
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: End time filter
+      responses:
+        '200':
+          description: RUM events
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RUMEvent'
+
+  /api/rum/metrics:
+    get:
+      tags:
+        - RUM
+      summary: Get RUM metrics
+      description: Get Real User Monitoring metrics
+      operationId: getRUMMetrics
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/OrganizationIdHeader'
+        - $ref: '#/components/parameters/OrganizationIdQuery'
+        - $ref: '#/components/parameters/ProjectIdHeader'
+        - $ref: '#/components/parameters/ProjectIdQuery'
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Start time filter
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: End time filter
+      responses:
+        '200':
+          description: RUM metrics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  metrics:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RUMMetric'
+
+  /api/key-transactions:
+    get:
+      tags:
+        - Key Transactions
+      summary: List key transactions
+      description: Get all configured key transactions
+      operationId: listKeyTransactions
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      responses:
+        '200':
+          description: List of key transactions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  transactions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/KeyTransaction'
+    post:
+      tags:
+        - Key Transactions
+      summary: Create key transaction
+      description: Create a new key transaction
+      operationId: createKeyTransaction
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KeyTransactionInput'
+      responses:
+        '200':
+          description: Key transaction created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KeyTransaction'
+
+  /api/key-transactions/{id}:
+    put:
+      tags:
+        - Key Transactions
+      summary: Update key transaction
+      description: Update an existing key transaction
+      operationId: updateKeyTransaction
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Key transaction ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/KeyTransactionInput'
+      responses:
+        '200':
+          description: Key transaction updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KeyTransaction'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags:
+        - Key Transactions
+      summary: Delete key transaction
+      description: Delete a key transaction
+      operationId: deleteKeyTransaction
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Key transaction ID
+      responses:
+        '204':
+          description: Key transaction deleted
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/slos:
+    get:
+      tags:
+        - SLOs
+      summary: List SLOs
+      description: Get all Service Level Objectives
+      operationId: listSLOs
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      responses:
+        '200':
+          description: List of SLOs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  slos:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SLO'
+    post:
+      tags:
+        - SLOs
+      summary: Create SLO
+      description: Create a new Service Level Objective
+      operationId: createSLO
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SLOInput'
+      responses:
+        '200':
+          description: SLO created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SLO'
+
+  /api/slos/{id}:
+    get:
+      tags:
+        - SLOs
+      summary: Get SLO
+      description: Get a specific SLO by ID
+      operationId: getSLO
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: SLO ID
+      responses:
+        '200':
+          description: SLO details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SLO'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags:
+        - SLOs
+      summary: Update SLO
+      description: Update an existing SLO
+      operationId: updateSLO
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: SLO ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SLOInput'
+      responses:
+        '200':
+          description: SLO updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SLO'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags:
+        - SLOs
+      summary: Delete SLO
+      description: Delete a SLO
+      operationId: deleteSLO
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: SLO ID
+      responses:
+        '204':
+          description: SLO deleted
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/slos/{id}/compliance:
+    get:
+      tags:
+        - SLOs
+      summary: Get SLO compliance metrics
+      description: Get compliance metrics for a specific SLO
+      operationId: getSLOCompliance
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: SLO ID
+      responses:
+        '200':
+          description: SLO compliance metrics
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  metrics:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SLOCompliance'
+
+  /api/dashboards:
+    get:
+      tags:
+        - Dashboards
+      summary: List dashboards
+      description: Get all dashboards
+      operationId: listDashboards
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      responses:
+        '200':
+          description: List of dashboards
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dashboards:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Dashboard'
+    post:
+      tags:
+        - Dashboards
+      summary: Create dashboard
+      description: Create a new dashboard
+      operationId: createDashboard
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DashboardInput'
+      responses:
+        '200':
+          description: Dashboard created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Dashboard'
+
+  /api/dashboards/{id}:
+    get:
+      tags:
+        - Dashboards
+      summary: Get dashboard
+      description: Get a specific dashboard by ID
+      operationId: getDashboard
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Dashboard ID
+      responses:
+        '200':
+          description: Dashboard details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Dashboard'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags:
+        - Dashboards
+      summary: Update dashboard
+      description: Update an existing dashboard
+      operationId: updateDashboard
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Dashboard ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DashboardInput'
+      responses:
+        '200':
+          description: Dashboard updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Dashboard'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags:
+        - Dashboards
+      summary: Delete dashboard
+      description: Delete a dashboard
+      operationId: deleteDashboard
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Dashboard ID
+      responses:
+        '204':
+          description: Dashboard deleted
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/alerts:
+    get:
+      tags:
+        - Alerts
+      summary: List alerts
+      description: Get all configured alerts
+      operationId: listAlerts
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      responses:
+        '200':
+          description: List of alerts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  alerts:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Alert'
+    post:
+      tags:
+        - Alerts
+      summary: Create alert
+      description: Create a new alert
+      operationId: createAlert
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AlertInput'
+      responses:
+        '200':
+          description: Alert created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Alert'
+
+  /api/alerts/{id}:
+    get:
+      tags:
+        - Alerts
+      summary: Get alert
+      description: Get a specific alert by ID
+      operationId: getAlert
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Alert ID
+      responses:
+        '200':
+          description: Alert details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Alert'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    put:
+      tags:
+        - Alerts
+      summary: Update alert
+      description: Update an existing alert
+      operationId: updateAlert
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Alert ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AlertInput'
+      responses:
+        '200':
+          description: Alert updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Alert'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags:
+        - Alerts
+      summary: Delete alert
+      description: Delete an alert
+      operationId: deleteAlert
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Alert ID
+      responses:
+        '204':
+          description: Alert deleted
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags:
+        - Alerts
+      summary: Test alert
+      description: Manually trigger an alert check
+      operationId: testAlert
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Alert ID
+      responses:
+        '200':
+          description: Alert check triggered
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: checking
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/control/keep:
+    post:
+      tags:
+        - Control
+      summary: Mark trace to keep
+      description: Mark a trace to be kept (not sampled out)
+      operationId: keepTrace
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - trace_id
+              properties:
+                trace_id:
+                  type: string
+                  example: trace-123
+      responses:
+        '200':
+          description: Trace marked to keep
+
+  /api/control/sampling:
+    post:
+      tags:
+        - Control
+      summary: Set sampling rate
+      description: Set the sampling rate for traces (0.0 to 1.0)
+      operationId: setSamplingRate
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - rate
+              properties:
+                rate:
+                  type: number
+                  minimum: 0
+                  maximum: 1
+                  example: 0.1
+                  description: Sampling rate (0.0 = 0%, 1.0 = 100%)
+      responses:
+        '200':
+          description: Sampling rate updated
+
+  /api/control/purge:
+    delete:
+      tags:
+        - Control
+      summary: Purge all data
+      description: Delete all traces and data from the system
+      operationId: purgeAllData
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: All data purged
+        '500':
+          description: Partial purge completed with errors
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+
+  /api/export/traces:
+    get:
+      tags:
+        - Export
+      summary: Export traces
+      description: Export traces in various formats (JSON, CSV, NDJSON)
+      operationId: exportTraces
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/OrganizationIdHeader'
+        - $ref: '#/components/parameters/OrganizationIdQuery'
+        - $ref: '#/components/parameters/ProjectIdHeader'
+        - $ref: '#/components/parameters/ProjectIdQuery'
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum: [json, csv, ndjson]
+            default: json
+          description: Export format
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: Start time filter
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+          description: End time filter
+      responses:
+        '200':
+          description: Exported traces
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  traces:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TraceSummary'
+                  total:
+                    type: integer
+            text/csv:
+              schema:
+                type: string
+            application/x-ndjson:
+              schema:
+                type: string
+
+  /api/anomalies:
+    get:
+      tags:
+        - Anomalies
+      summary: List anomalies
+      description: Get detected anomalies
+      operationId: listAnomalies
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/OrganizationIdHeader'
+        - $ref: '#/components/parameters/OrganizationIdQuery'
+        - $ref: '#/components/parameters/ProjectIdHeader'
+        - $ref: '#/components/parameters/ProjectIdQuery'
+        - name: service
+          in: query
+          schema:
+            type: string
+          description: Filter by service
+        - name: severity
+          in: query
+          schema:
+            type: string
+            enum: [low, medium, high, critical]
+          description: Filter by severity
+      responses:
+        '200':
+          description: List of anomalies
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  anomalies:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Anomaly'
+
+  /api/anomalies/analyze:
+    post:
+      tags:
+        - Anomalies
+      summary: Analyze for anomalies
+      description: Trigger anomaly detection analysis
+      operationId: analyzeAnomalies
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                service:
+                  type: string
+                  description: Service to analyze (optional, analyzes all if not provided)
+                time_window:
+                  type: integer
+                  description: Time window in hours
+                  default: 24
+      responses:
+        '200':
+          description: Analysis results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  anomalies:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Anomaly'
+
+  /api/languages:
+    get:
+      tags:
+        - System
+      summary: List languages
+      description: Get all detected programming languages
+      operationId: listLanguages
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/OrganizationIdHeader'
+        - $ref: '#/components/parameters/OrganizationIdQuery'
+        - $ref: '#/components/parameters/ProjectIdHeader'
+        - $ref: '#/components/parameters/ProjectIdQuery'
+      responses:
+        '200':
+          description: List of languages
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  languages:
+                    type: array
+                    items:
+                      type: string
+                      example: php
+
+  /api/frameworks:
+    get:
+      tags:
+        - System
+      summary: List frameworks
+      description: Get all detected frameworks
+      operationId: listFrameworks
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/OrganizationIdHeader'
+        - $ref: '#/components/parameters/OrganizationIdQuery'
+        - $ref: '#/components/parameters/ProjectIdHeader'
+        - $ref: '#/components/parameters/ProjectIdQuery'
+      responses:
+        '200':
+          description: List of frameworks
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  frameworks:
+                    type: array
+                    items:
+                      type: string
+                      example: symfony
+
+  /api/dumps:
+    get:
+      tags:
+        - System
+      summary: List dumps
+      description: Get variable dumps from traces
+      operationId: listDumps
+      security:
+        - bearerAuth: []
+        - apiKeyAuth: []
+      parameters:
+        - $ref: '#/components/parameters/OrganizationIdHeader'
+        - $ref: '#/components/parameters/OrganizationIdQuery'
+        - $ref: '#/components/parameters/ProjectIdHeader'
+        - $ref: '#/components/parameters/ProjectIdQuery'
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+          description: Maximum number of dumps to return
+        - name: cursor
+          in: query
+          schema:
+            type: integer
+          description: Pagination cursor
+      responses:
+        '200':
+          description: List of dumps
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dumps:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Dump'
+                  total:
+                    type: integer
+                  has_more:
+                    type: boolean
+                  next_cursor:
+                    type: integer
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT token from /api/auth/login
+    apiKeyAuth:
+      type: apiKey
+      in: header
+      name: Authorization
+      description: API key in format {org_id}:{project_id}:{key_hash} or DSN
+
+  parameters:
+    OrganizationIdHeader:
+      name: X-Organization-ID
+      in: header
+      schema:
+        type: string
+      description: Organization ID (use "all" for all organizations)
+      required: false
+    OrganizationIdQuery:
+      name: organization_id
+      in: query
+      schema:
+        type: string
+      description: Organization ID (use "all" for all organizations)
+      required: false
+    ProjectIdHeader:
+      name: X-Project-ID
+      in: header
+      schema:
+        type: string
+      description: Project ID (use "all" for all projects)
+      required: false
+    ProjectIdQuery:
+      name: project_id
+      in: query
+      schema:
+        type: string
+      description: Project ID (use "all" for all projects)
+      required: false
+    TraceId:
+      name: trace_id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Trace ID
+    KeyId:
+      name: key_id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: API key ID
+    ProjectIdPath:
+      name: project_id
+      in: path
+      required: true
+      schema:
+        type: string
+      description: Project ID
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Error message
+      example:
+        error: "Invalid request"
+
+    LoginResponse:
+      type: object
+      properties:
+        token:
+          type: string
+          description: JWT token
+          example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+        username:
+          type: string
+          example: admin
+        role:
+          type: string
+          enum: [viewer, editor, admin]
+          example: admin
+        expires:
+          type: integer
+          description: Token expiration timestamp (Unix seconds)
+          example: 1704067200
+
+    User:
+      type: object
+      properties:
+        id:
+          type: string
+          example: user-123
+        username:
+          type: string
+          example: newuser
+        email:
+          type: string
+          format: email
+          example: user@example.com
+        role:
+          type: string
+          enum: [viewer, editor, admin]
+          example: viewer
+
+    APIKey:
+      type: object
+      properties:
+        key_id:
+          type: string
+          example: key-123
+        name:
+          type: string
+          example: Production API Key
+        org_id:
+          type: string
+          example: org-123
+        project_id:
+          type: string
+          example: proj-456
+        key_hash:
+          type: string
+          description: Hashed API key (only shown on creation)
+          example: abc123def456...
+        created_at:
+          type: string
+          format: date-time
+          example: "2024-01-01T00:00:00Z"
+
+    Organization:
+      type: object
+      properties:
+        org_id:
+          type: string
+          example: org-123
+        name:
+          type: string
+          example: My Organization
+        settings:
+          type: string
+          description: JSON settings string
+          example: '{}'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    Project:
+      type: object
+      properties:
+        project_id:
+          type: string
+          example: proj-456
+        name:
+          type: string
+          example: My Project
+        org_id:
+          type: string
+          example: org-123
+        dsn:
+          type: string
+          example: https://agent.example.com
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    TraceSummary:
+      type: object
+      properties:
+        trace_id:
+          type: string
+          example: trace-123
+        service:
+          type: string
+          example: api-service
+        name:
+          type: string
+          example: GET /api/users
+        start_ts:
+          type: string
+          format: date-time
+          example: "2024-01-01T00:00:00Z"
+        end_ts:
+          type: string
+          format: date-time
+          example: "2024-01-01T00:00:00.125Z"
+        duration_ms:
+          type: number
+          example: 125.456
+        status:
+          type: string
+          enum: [ok, error]
+          example: ok
+        span_count:
+          type: integer
+          example: 5
+        language:
+          type: string
+          example: php
+        framework:
+          type: string
+          example: symfony
+
+    Trace:
+      type: object
+      properties:
+        trace_id:
+          type: string
+          example: trace-123
+        spans:
+          type: array
+          items:
+            $ref: '#/components/schemas/Span'
+        root:
+          $ref: '#/components/schemas/Span'
+
+    Span:
+      type: object
+      properties:
+        trace_id:
+          type: string
+          example: trace-123
+        span_id:
+          type: string
+          example: span-456
+        parent_id:
+          type: string
+          nullable: true
+          example: span-455
+        service:
+          type: string
+          example: api-service
+        name:
+          type: string
+          example: GET /api/users
+        start_ts:
+          type: integer
+          format: int64
+          description: Start timestamp in milliseconds
+          example: 1704067200000
+        end_ts:
+          type: integer
+          format: int64
+          description: End timestamp in milliseconds
+          example: 1704067200125
+        duration_ms:
+          type: number
+          example: 125.456
+        cpu_ms:
+          type: number
+          example: 50.2
+        status:
+          type: string
+          enum: [ok, error]
+          example: ok
+        language:
+          type: string
+          nullable: true
+          example: php
+        language_version:
+          type: string
+          nullable: true
+          example: "8.4"
+        framework:
+          type: string
+          nullable: true
+          example: symfony
+        framework_version:
+          type: string
+          nullable: true
+          example: "7.0"
+        url_scheme:
+          type: string
+          nullable: true
+          example: https
+        url_host:
+          type: string
+          nullable: true
+          example: api.example.com
+        url_path:
+          type: string
+          nullable: true
+          example: /api/users
+        net:
+          $ref: '#/components/schemas/NetworkMetrics'
+        sql:
+          type: array
+          items:
+            $ref: '#/components/schemas/SQLQuery'
+        http:
+          type: array
+          items:
+            $ref: '#/components/schemas/HTTPRequest'
+        cache:
+          type: array
+          items:
+            $ref: '#/components/schemas/CacheOperation'
+        redis:
+          type: array
+          items:
+            $ref: '#/components/schemas/RedisOperation'
+        stack:
+          type: array
+          items:
+            $ref: '#/components/schemas/CallNode'
+        tags:
+          type: object
+          additionalProperties: true
+        children:
+          type: array
+          items:
+            $ref: '#/components/schemas/Span'
+
+    NetworkMetrics:
+      type: object
+      properties:
+        bytes_sent:
+          type: integer
+          example: 1024
+        bytes_received:
+          type: integer
+          example: 2048
+
+    SQLQuery:
+      type: object
+      properties:
+        query:
+          type: string
+          example: SELECT * FROM users WHERE id = ?
+        duration:
+          type: number
+          description: Duration in seconds
+          example: 0.0105
+        duration_ms:
+          type: number
+          description: Duration in milliseconds
+          example: 10.5
+        timestamp:
+          type: number
+          description: Timestamp in Unix seconds
+          example: 1704067200.0
+        type:
+          type: string
+          example: query
+        query_type:
+          type: string
+          enum: [SELECT, INSERT, UPDATE, DELETE]
+          example: SELECT
+        rows_affected:
+          type: integer
+          example: 1
+        rows_returned:
+          type: integer
+          example: 1
+        db_system:
+          type: string
+          example: mysql
+        db_host:
+          type: string
+          example: db.example.com
+        db_dsn:
+          type: string
+          example: mysql:host=db.example.com;dbname=mydb
+
+    HTTPRequest:
+      type: object
+      properties:
+        url:
+          type: string
+          example: https://api.example.com/users
+        method:
+          type: string
+          example: GET
+        status_code:
+          type: integer
+          example: 200
+        bytes_sent:
+          type: integer
+          example: 256
+        bytes_received:
+          type: integer
+          example: 1024
+        duration:
+          type: number
+          description: Duration in seconds
+          example: 0.125
+        duration_ms:
+          type: number
+          description: Duration in milliseconds
+          example: 125.0
+        timestamp:
+          type: number
+          description: Timestamp in Unix seconds
+          example: 1704067200.0
+        type:
+          type: string
+          example: curl
+        uri:
+          type: string
+          example: /users
+        query_string:
+          type: string
+          example: page=1
+        request_headers_raw:
+          type: string
+          example: "Host: api.example.com\r\nUser-Agent: MyApp/1.0"
+        response_headers_raw:
+          type: string
+          example: "Content-Type: application/json\r\nContent-Length: 1024"
+        response_size:
+          type: integer
+          example: 1024
+        request_size:
+          type: integer
+          example: 256
+        dns_time:
+          type: number
+          description: DNS lookup time in seconds
+          example: 0.001
+        dns_time_ms:
+          type: number
+          description: DNS lookup time in milliseconds
+          example: 1.0
+        connect_time:
+          type: number
+          description: Connection time in seconds
+          example: 0.005
+        connect_time_ms:
+          type: number
+          description: Connection time in milliseconds
+          example: 5.0
+        network_time:
+          type: number
+          description: Total network time in seconds
+          example: 0.125
+        network_time_ms:
+          type: number
+          description: Total network time in milliseconds
+          example: 125.0
+        error:
+          type: string
+          nullable: true
+          example: null
+
+    CacheOperation:
+      type: object
+      properties:
+        key:
+          type: string
+          example: user:123
+        operation:
+          type: string
+          enum: [get, set, delete]
+          example: get
+        hit:
+          type: boolean
+          example: true
+        duration:
+          type: number
+          description: Duration in seconds
+          example: 0.001
+        duration_ms:
+          type: number
+          description: Duration in milliseconds
+          example: 1.0
+        timestamp:
+          type: number
+          description: Timestamp in Unix seconds
+          example: 1704067200.0
+        data_size:
+          type: integer
+          example: 1024
+        cache_type:
+          type: string
+          example: apcu
+
+    RedisOperation:
+      type: object
+      properties:
+        command:
+          type: string
+          example: GET
+        key:
+          type: string
+          example: user:123
+        hit:
+          type: boolean
+          example: true
+        duration:
+          type: number
+          description: Duration in seconds
+          example: 0.002
+        duration_ms:
+          type: number
+          description: Duration in milliseconds
+          example: 2.0
+        timestamp:
+          type: number
+          description: Timestamp in Unix seconds
+          example: 1704067200.0
+        type:
+          type: string
+          example: redis
+        error:
+          type: string
+          nullable: true
+          example: null
+
+    CallNode:
+      type: object
+      properties:
+        call_id:
+          type: string
+          example: call-123
+        function:
+          type: string
+          example: getUser
+        class:
+          type: string
+          example: UserRepository
+        file:
+          type: string
+          example: /app/src/Repository/UserRepository.php
+        line:
+          type: integer
+          example: 42
+        duration_ms:
+          type: number
+          example: 10.5
+        cpu_ms:
+          type: number
+          example: 5.2
+        memory_delta:
+          type: integer
+          example: 1024
+        network_bytes_sent:
+          type: integer
+          example: 256
+        network_bytes_received:
+          type: integer
+          example: 512
+        parent_id:
+          type: string
+          example: call-122
+        depth:
+          type: integer
+          example: 3
+        function_type:
+          type: integer
+          example: 1
+        sql_queries:
+          type: array
+          items:
+            $ref: '#/components/schemas/SQLQuery'
+        http_requests:
+          type: array
+          items:
+            $ref: '#/components/schemas/HTTPRequest'
+        cache_operations:
+          type: array
+          items:
+            $ref: '#/components/schemas/CacheOperation'
+        redis_operations:
+          type: array
+          items:
+            $ref: '#/components/schemas/RedisOperation'
+        children:
+          type: array
+          items:
+            $ref: '#/components/schemas/CallNode'
+
+    Service:
+      type: object
+      properties:
+        service:
+          type: string
+          example: api-service
+        language:
+          type: string
+          nullable: true
+          example: php
+        language_version:
+          type: string
+          nullable: true
+          example: "8.4"
+        framework:
+          type: string
+          nullable: true
+          example: symfony
+        framework_version:
+          type: string
+          nullable: true
+          example: "7.0"
+        total_traces:
+          type: integer
+          example: 1000
+        total_spans:
+          type: integer
+          example: 5000
+        error_count:
+          type: integer
+          example: 50
+        error_rate:
+          type: number
+          description: Error rate as percentage
+          example: 1.0
+        total_cpu_ms:
+          type: number
+          example: 50000.0
+        total_bytes_sent:
+          type: integer
+          example: 1048576
+        total_bytes_received:
+          type: integer
+          example: 2097152
+        total_http_requests:
+          type: integer
+          example: 200
+        sql_query_count:
+          type: integer
+          example: 100
+        avg_duration:
+          type: number
+          example: 125.5
+        p95_duration:
+          type: number
+          example: 250.0
+        p99_duration:
+          type: number
+          example: 500.0
+        top_sql_queries:
+          type: array
+          items:
+            type: object
+            properties:
+              fingerprint:
+                type: string
+              execution_count:
+                type: integer
+              avg_duration:
+                type: number
+        top_endpoints:
+          type: array
+          items:
+            type: object
+            properties:
+              endpoint:
+                type: string
+              request_count:
+                type: integer
+              avg_duration:
+                type: number
+              error_count:
+                type: integer
+
+    ServiceTotals:
+      type: object
+      properties:
+        total_traces:
+          type: integer
+          example: 10000
+        total_spans:
+          type: integer
+          example: 50000
+        error_count:
+          type: integer
+          example: 500
+        total_cpu_ms:
+          type: number
+          example: 500000.0
+        total_bytes_sent:
+          type: integer
+          example: 10485760
+        total_bytes_received:
+          type: integer
+          example: 20971520
+        total_http_requests:
+          type: integer
+          example: 2000
+        total_sql_queries:
+          type: integer
+          example: 1000
+        avg_duration:
+          type: number
+          example: 125.5
+
+    ServiceDetails:
+      allOf:
+        - $ref: '#/components/schemas/Service'
+        - type: object
+          properties:
+            traces:
+              type: array
+              items:
+                $ref: '#/components/schemas/TraceSummary'
+
+    ServiceMetadata:
+      type: object
+      properties:
+        service:
+          type: string
+          example: api-service
+        language:
+          type: string
+          nullable: true
+          example: php
+        language_version:
+          type: string
+          nullable: true
+          example: "8.4"
+        framework:
+          type: string
+          nullable: true
+          example: symfony
+        framework_version:
+          type: string
+          nullable: true
+          example: "7.0"
+
+    ServiceMap:
+      type: object
+      properties:
+        nodes:
+          type: array
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+              name:
+                type: string
+              service:
+                type: string
+        edges:
+          type: array
+          items:
+            type: object
+            properties:
+              from:
+                type: string
+              to:
+                type: string
+              latency_ms:
+                type: number
+              error_rate:
+                type: number
+              throughput:
+                type: number
+
+    NetworkMetric:
+      type: object
+      properties:
+        time:
+          type: string
+          format: date-time
+        service:
+          type: string
+        bytes_sent:
+          type: integer
+        bytes_received:
+          type: integer
+
+    PerformanceMetric:
+      type: object
+      properties:
+        time:
+          type: string
+          format: date-time
+        service:
+          type: string
+        avg_duration:
+          type: number
+        p95_duration:
+          type: number
+        p99_duration:
+          type: number
+        throughput:
+          type: integer
+        error_rate:
+          type: number
+
+    SQLQuerySummary:
+      type: object
+      properties:
+        fingerprint:
+          type: string
+          example: SELECT * FROM users WHERE id = ?
+        service:
+          type: string
+          example: api-service
+        execution_count:
+          type: integer
+          example: 1000
+        avg_duration:
+          type: number
+          example: 10.5
+        p95_duration:
+          type: number
+          example: 20.0
+        p99_duration:
+          type: number
+          example: 50.0
+        max_duration:
+          type: number
+          example: 100.0
+
+    SQLQueryDetails:
+      allOf:
+        - $ref: '#/components/schemas/SQLQuerySummary'
+        - type: object
+          properties:
+            example_query:
+              type: string
+              description: Example SQL query text
+            trends:
+              type: array
+              items:
+                type: object
+                properties:
+                  time:
+                    type: string
+                    format: date-time
+                  avg_duration:
+                    type: number
+                  p95_duration:
+                    type: number
+
+    ErrorGroup:
+      type: object
+      properties:
+        error_id:
+          type: string
+          example: api-service:Division by zero
+        error_message:
+          type: string
+          example: Division by zero
+        service:
+          type: string
+          example: api-service
+        count:
+          type: integer
+          example: 10
+        first_seen:
+          type: string
+          format: date-time
+        last_seen:
+          type: string
+          format: date-time
+
+    ErrorDetails:
+      allOf:
+        - $ref: '#/components/schemas/ErrorGroup'
+        - type: object
+          properties:
+            stack_trace:
+              type: string
+              description: Stack trace as JSON string or array
+            related_traces:
+              type: array
+              items:
+                type: object
+                properties:
+                  trace_id:
+                    type: string
+                  start_ts:
+                    type: string
+                    format: date-time
+            trends:
+              type: array
+              items:
+                type: object
+                properties:
+                  time:
+                    type: string
+                    format: date-time
+                  count:
+                    type: integer
+
+    LogEntry:
+      type: object
+      properties:
+        id:
+          type: string
+          example: log-123
+        trace_id:
+          type: string
+          example: trace-123
+        span_id:
+          type: string
+          nullable: true
+          example: span-456
+        level:
+          type: string
+          enum: [ERROR, WARN, INFO, DEBUG, CRITICAL]
+          example: ERROR
+        message:
+          type: string
+          example: Failed to connect to database
+        service:
+          type: string
+          example: api-service
+        timestamp_ms:
+          type: integer
+          format: int64
+          description: Timestamp in milliseconds
+          example: 1704067200000
+        fields:
+          type: object
+          additionalProperties: true
+          description: Additional log fields
+          example:
+            file: /app/src/Database.php
+            line: 50
+            error_code: DB_CONNECTION_FAILED
+
+    RUMEvent:
+      type: object
+      properties:
+        event_id:
+          type: string
+        trace_id:
+          type: string
+        session_id:
+          type: string
+        event_type:
+          type: string
+          enum: [pageview, click, navigation, error]
+        timestamp:
+          type: integer
+          format: int64
+        url:
+          type: string
+        user_agent:
+          type: string
+        viewport:
+          type: object
+          properties:
+            width:
+              type: integer
+            height:
+              type: integer
+
+    RUMMetric:
+      type: object
+      properties:
+        time:
+          type: string
+          format: date-time
+        page_views:
+          type: integer
+        unique_visitors:
+          type: integer
+        avg_page_load_time:
+          type: number
+        error_rate:
+          type: number
+
+    KeyTransaction:
+      type: object
+      properties:
+        id:
+          type: string
+          example: kt-123
+        name:
+          type: string
+          example: User Login
+        service:
+          type: string
+          example: api-service
+        pattern:
+          type: string
+          example: POST /api/auth/login
+        created_at:
+          type: string
+          format: date-time
+
+    KeyTransactionInput:
+      type: object
+      required:
+        - name
+        - service
+        - pattern
+      properties:
+        name:
+          type: string
+          example: User Login
+        service:
+          type: string
+          example: api-service
+        pattern:
+          type: string
+          example: POST /api/auth/login
+
+    SLO:
+      type: object
+      properties:
+        id:
+          type: string
+          example: slo-123
+        name:
+          type: string
+          example: API Availability
+        description:
+          type: string
+          example: 99.9% uptime target
+        service:
+          type: string
+          example: api-service
+        slo_type:
+          type: string
+          enum: [availability, latency, error_rate, throughput]
+          example: availability
+        target_value:
+          type: number
+          description: Target value (percentage, milliseconds, etc.)
+          example: 99.9
+        window_hours:
+          type: integer
+          description: Time window in hours
+          example: 24
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    SLOInput:
+      type: object
+      required:
+        - name
+        - service
+        - slo_type
+        - target_value
+        - window_hours
+      properties:
+        name:
+          type: string
+          example: API Availability
+        description:
+          type: string
+          example: 99.9% uptime target
+        service:
+          type: string
+          example: api-service
+        slo_type:
+          type: string
+          enum: [availability, latency, error_rate, throughput]
+          example: availability
+        target_value:
+          type: number
+          example: 99.9
+        window_hours:
+          type: integer
+          example: 24
+
+    SLOCompliance:
+      type: object
+      properties:
+        actual_value:
+          type: number
+        compliance_percentage:
+          type: number
+        is_breach:
+          type: boolean
+        window_start:
+          type: string
+          format: date-time
+        window_end:
+          type: string
+          format: date-time
+
+    Dashboard:
+      type: object
+      properties:
+        id:
+          type: string
+          example: dash-123
+        name:
+          type: string
+          example: Production Dashboard
+        description:
+          type: string
+          example: Main production monitoring dashboard
+        widgets:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    DashboardInput:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          example: Production Dashboard
+        description:
+          type: string
+          example: Main production monitoring dashboard
+        widgets:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+
+    Alert:
+      type: object
+      properties:
+        id:
+          type: string
+          example: alert-123
+        name:
+          type: string
+          example: High Error Rate
+        description:
+          type: string
+          example: Alert when error rate exceeds 5%
+        service:
+          type: string
+          example: api-service
+        condition:
+          type: string
+          example: error_rate > 5
+        threshold:
+          type: number
+          example: 5.0
+        enabled:
+          type: boolean
+          example: true
+        created_at:
+          type: string
+          format: date-time
+
+    AlertInput:
+      type: object
+      required:
+        - name
+        - service
+        - condition
+        - threshold
+      properties:
+        name:
+          type: string
+          example: High Error Rate
+        description:
+          type: string
+          example: Alert when error rate exceeds 5%
+        service:
+          type: string
+          example: api-service
+        condition:
+          type: string
+          example: error_rate > 5
+        threshold:
+          type: number
+          example: 5.0
+        enabled:
+          type: boolean
+          default: true
+
+    Anomaly:
+      type: object
+      properties:
+        id:
+          type: string
+          example: anom-123
+        type:
+          type: string
+          enum: [duration, error_rate, throughput]
+          example: duration
+        service:
+          type: string
+          example: api-service
+        metric:
+          type: string
+          example: avg_duration
+        value:
+          type: number
+          example: 500.0
+        expected:
+          type: number
+          example: 125.0
+        score:
+          type: number
+          description: Anomaly score (0-1, higher = more anomalous)
+          minimum: 0
+          maximum: 1
+          example: 0.85
+        severity:
+          type: string
+          enum: [low, medium, high, critical]
+          example: high
+        detected_at:
+          type: string
+          format: date-time
+        metadata:
+          type: object
+          additionalProperties: true
+
+    Dump:
+      type: object
+      properties:
+        id:
+          type: string
+          example: dump-123
+        trace_id:
+          type: string
+          example: trace-123
+        span_id:
+          type: string
+          example: span-456
+        service:
+          type: string
+          example: api-service
+        span_name:
+          type: string
+          example: getUser
+        timestamp:
+          type: integer
+          format: int64
+          description: Timestamp in milliseconds
+        file:
+          type: string
+          nullable: true
+          example: /app/src/Repository/UserRepository.php
+        line:
+          type: integer
+          nullable: true
+          example: 42
+        data:
+          type: object
+          additionalProperties: true
+          description: Dumped variable data
+        text:
+          type: string
+          nullable: true
+          description: Text representation of dump
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: "Invalid request"
+
+    Unauthorized:
+      description: Unauthorized
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: "Invalid credentials"
+
+    Forbidden:
+      description: Forbidden
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: "Forbidden"
+
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: "Not found"
+
+    MethodNotAllowed:
+      description: Method not allowed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: "Method not allowed"
+
+    InternalServerError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: "Internal server error"
+
