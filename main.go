@@ -3605,6 +3605,7 @@ func main() {
 			query = fmt.Sprintf(`SELECT 
 				http,
 				tags,
+				net,
 				service,
 				start_ts,
 				duration_ms,
@@ -3617,6 +3618,7 @@ func main() {
 			query = fmt.Sprintf(`SELECT 
 				http,
 				tags,
+				net,
 				service,
 				start_ts,
 				duration_ms,
@@ -3796,6 +3798,21 @@ func main() {
 			durationMs := getFloat64(row, "duration_ms")
 			spanStatus := getString(row, "status")
 			
+			// Extract net field for fallback bytes
+			var netBytesSent, netBytesRecv int64
+			netData := getString(row, "net")
+			if netData != "" && netData != "{}" {
+				var netMap map[string]interface{}
+				if err := json.Unmarshal([]byte(netData), &netMap); err == nil {
+					if sent, ok := netMap["bytes_sent"].(float64); ok {
+						netBytesSent = int64(sent)
+					}
+					if recv, ok := netMap["bytes_received"].(float64); ok {
+						netBytesRecv = int64(recv)
+					}
+				}
+			}
+			
 			// First, process outgoing HTTP requests from http field
 			httpData := getString(row, "http")
 			if httpData != "" && httpData != "[]" && httpData != "null" {
@@ -3864,11 +3881,31 @@ func main() {
 								req["method"] = m
 							}
 							
-							// Get status code from http_response
+							// Extract request_size as bytes_sent from http_request
+							if reqSize, ok := httpRequest["request_size"].(float64); ok {
+								req["bytes_sent"] = reqSize
+								req["request_size"] = reqSize
+							} else if netBytesSent > 0 {
+								// Fallback to net bytes_sent if request_size not available
+								req["bytes_sent"] = float64(netBytesSent)
+							}
+							
+							// Get status code and response size from http_response
 							if httpResponse, ok := tagsMap["http_response"].(map[string]interface{}); ok {
 								if sc, ok := httpResponse["status_code"].(float64); ok {
 									req["status_code"] = sc
 								}
+								// Extract response_size as bytes_received
+								if respSize, ok := httpResponse["response_size"].(float64); ok {
+									req["bytes_received"] = respSize
+									req["response_size"] = respSize
+								} else if netBytesRecv > 0 {
+									// Fallback to net bytes_received if response_size not available
+									req["bytes_received"] = float64(netBytesRecv)
+								}
+							} else if netBytesRecv > 0 {
+								// Fallback to net bytes_received if http_response not available
+								req["bytes_received"] = float64(netBytesRecv)
 							}
 							
 							// Use span duration
