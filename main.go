@@ -3666,6 +3666,8 @@ func main() {
 			TotalBytesRecv   int64
 			MinDuration      float64
 			MaxDuration      float64
+			StatusCodeCounts map[int]int64 // Track status code frequencies
+			MostCommonStatus int           // Most common status code
 		}
 		httpCallsMap := make(map[string]*HttpCallStats)
 		totalCalls := int64(0)
@@ -3717,12 +3719,14 @@ func main() {
 			call, exists := httpCallsMap[key]
 			if !exists {
 				call = &HttpCallStats{
-					URL:           requestURL,
-					URI:           uri,
-					Method:        method,
-					Service:       serviceName,
-					MinDuration:   999999.0,
-					MaxDuration:   0.0,
+					URL:             requestURL,
+					URI:             uri,
+					Method:          method,
+					Service:         serviceName,
+					MinDuration:     999999.0,
+					MaxDuration:     0.0,
+					StatusCodeCounts: make(map[int]int64),
+					MostCommonStatus: 0,
 				}
 				httpCallsMap[key] = call
 			}
@@ -3752,6 +3756,15 @@ func main() {
 				statusCode = int(sc)
 			} else if sc, ok := req["statusCode"].(float64); ok {
 				statusCode = int(sc)
+			}
+			
+			// Track status code frequency
+			if statusCode > 0 {
+				call.StatusCodeCounts[statusCode]++
+				// Update most common status code
+				if call.StatusCodeCounts[statusCode] > call.StatusCodeCounts[call.MostCommonStatus] {
+					call.MostCommonStatus = statusCode
+				}
 			}
 			
 			if statusCode >= 400 {
@@ -3888,9 +3901,16 @@ func main() {
 				}
 			}
 			
+			// Include status code in response (most common status code for this endpoint)
+			statusCode := 0
+			if call.MostCommonStatus > 0 {
+				statusCode = call.MostCommonStatus
+			}
+			
 			httpCalls = append(httpCalls, map[string]interface{}{
 				"url":                 call.URL,
 				"uri":                 call.URI,
+				"request_uri":        call.URI, // Add request_uri for compatibility
 				"method":             call.Method,
 				"service":            call.Service,
 				"call_count":         call.CallCount,
@@ -3901,6 +3921,7 @@ func main() {
 				"error_rate":        errorRate,
 				"total_bytes_sent":   call.TotalBytesSent,
 				"total_bytes_received": call.TotalBytesRecv,
+				"status_code":       statusCode, // Include actual status code
 			})
 		}
 		
