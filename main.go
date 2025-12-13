@@ -3813,8 +3813,11 @@ func main() {
 						if h, ok := httpRequest["host"].(string); ok {
 							host = h
 						}
+						// Prefer request_uri (actual path) over uri (which may contain /index.php)
 						uri := ""
-						if u, ok := httpRequest["uri"].(string); ok {
+						if reqUri, ok := httpRequest["request_uri"].(string); ok && reqUri != "" {
+							uri = reqUri
+						} else if u, ok := httpRequest["uri"].(string); ok {
 							uri = u
 						}
 						
@@ -3838,6 +3841,10 @@ func main() {
 								req["url"] = url + "?" + qs
 							}
 							req["uri"] = uriWithQuery
+							// Also include request_uri if available
+							if reqUri, ok := httpRequest["request_uri"].(string); ok && reqUri != "" {
+								req["request_uri"] = reqUri
+							}
 							
 							// Get method
 							if m, ok := httpRequest["method"].(string); ok {
@@ -7458,6 +7465,11 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 						if url != "" {
 							broadcastData["url"] = url
 							broadcastData["uri"] = uri
+							
+							// Forward request_uri if available (contains actual path, not cleaned uri)
+							if reqUri, ok := httpRequest["request_uri"].(string); ok && reqUri != "" {
+								broadcastData["request_uri"] = reqUri
+							}
 							
 							// Get method
 							if m, ok := httpRequest["method"].(string); ok {
