@@ -253,10 +253,28 @@ func (smp *ServiceMapProcessor) ProcessExternalDependencies(span *Span) {
 		for _, redisItem := range span.Redis {
 			if redisMap, ok := redisItem.(map[string]interface{}); ok {
 				host := "redis"
+				redisHost := ""
+				redisPort := ""
+				
+				// Extract host
 				if h, ok := redisMap["host"].(string); ok && h != "" {
-					host = fmt.Sprintf("redis://%s", h)
+					redisHost = h
 				} else if h, ok := redisMap["Host"].(string); ok && h != "" {
-					host = fmt.Sprintf("redis://%s", h)
+					redisHost = h
+				}
+				
+				// Extract port
+				if p, ok := redisMap["port"].(string); ok && p != "" {
+					redisPort = p
+				} else if p, ok := redisMap["Port"].(string); ok && p != "" {
+					redisPort = p
+				}
+				
+				// Format host:port based on available information
+				if redisHost != "" && redisPort != "" {
+					host = fmt.Sprintf("redis://%s:%s", redisHost, redisPort)
+				} else if redisHost != "" {
+					host = fmt.Sprintf("redis://%s", redisHost)
 				}
 				
 				key := fmt.Sprintf("%s->redis->%s", span.Service, host)
