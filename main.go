@@ -19,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -284,6 +285,46 @@ func parseDateTime(row map[string]interface{}, key string) int64 {
 		}
 	}
 	return 0
+}
+
+// normalizeTimestamp converts a timestamp to milliseconds if it appears to be in seconds
+// Year 2000 in milliseconds = 946684800000
+// If timestamp is less than this threshold, it's likely in seconds and needs conversion
+func normalizeTimestamp(ts int64) int64 {
+	// Threshold: year 2000 in milliseconds
+	const year2000Ms = 946684800000
+	
+	// If timestamp is less than year 2000 in milliseconds, it might be in seconds
+	// But we need to be careful - very small values might be legitimate
+	// Check if interpreting as milliseconds gives a date before year 2000
+	if ts > 0 && ts < year2000Ms {
+		// Check if it's a reasonable Unix timestamp in seconds (between 1970 and 2100)
+		// Year 1970 = 0 seconds, Year 2100 = 4102444800 seconds
+		if ts >= 0 && ts <= 4102444800 {
+			// This looks like seconds, convert to milliseconds
+			converted := ts * 1000
+			// Verify the converted value makes sense (should be >= year 2000 in ms)
+			if converted >= year2000Ms {
+				log.Printf("[WARN] Timestamp appears to be in seconds, converting: %d -> %d", ts, converted)
+				return converted
+			}
+		}
+	}
+	
+	// Also check for timestamps that are clearly in seconds (year 2081 range)
+	// Year 2081 in seconds ≈ 3500000000, in milliseconds ≈ 3500000000000
+	// If timestamp is between 3000000000 and 5000000000, it's likely seconds
+	if ts >= 3000000000 && ts <= 5000000000 {
+		converted := ts * 1000
+		// Verify converted value is reasonable (should be a future date but not too far)
+		// Year 2100 in milliseconds = 4102444800000
+		if converted <= 4102444800000 {
+			log.Printf("[WARN] Timestamp appears to be in seconds (year 2081 range), converting: %d -> %d", ts, converted)
+			return converted
+		}
+	}
+	
+	return ts
 }
 
 // Enrich spans with full details from spans_full
@@ -1200,9 +1241,214 @@ func main() {
 	
 	// Stats
 	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
-		stats := map[string]interface{}{
-			"queue_size": atomic.LoadInt64(&currentQueueSize),
+		if r.Method != "GET" {
+			http.Error(w, "method not allowed", 405)
+			return
 		}
+		
+		ctx, _ := ExtractTenantContext(r, queryClient)
+		timeFrom := r.URL.Query().Get("from")
+		timeTo := r.URL.Query().Get("to")
+		
+		// Build tenant filter
+		var tenantFilter string
+		if ctx.IsAllTenants() {
+			tenantFilter = ""
+		} else {
+			tenantFilter = fmt.Sprintf("(coalesce(nullif(organization_id, ''), 'default-org') = '%s' AND coalesce(nullif(project_id, ''), 'default-project') = '%s')",
+				escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID))
+		}
+		
+		// Build time filter
+		var timeFilter string
+		if timeFrom != "" {
+			timeFilter += fmt.Sprintf(" AND start_ts >= '%s'", escapeSQL(timeFrom))
+		}
+		if timeTo != "" {
+			timeFilter += fmt.Sprintf(" AND start_ts <= '%s'", escapeSQL(timeTo))
+		}
+		
+		// Build WHERE clause
+		var whereClause string
+		if tenantFilter != "" {
+			whereClause = " WHERE " + tenantFilter + timeFilter
+		} else if timeFilter != "" {
+			whereClause = " WHERE 1=1" + timeFilter
+		} else {
+			whereClause = ""
+		}
+		
+		// Get traces statistics
+		tracesQuery := `SELECT 
+			count(DISTINCT trace_id) as total_traces,
+			count(*) as total_spans,
+			sum(CASE WHEN status = 'error' OR status = '0' THEN 1 ELSE 0 END) * 100.0 / greatest(count(*), 1) as error_rate,
+			avg(duration_ms) as avg_duration_ms,
+			quantile(0.50)(duration_ms) as p50_duration_ms,
+			quantile(0.95)(duration_ms) as p95_duration_ms,
+			quantile(0.99)(duration_ms) as p99_duration_ms
+			FROM opa.spans_min` + whereClause
+		
+		tracesRows, err := queryClient.Query(tracesQuery)
+		if err != nil {
+			LogError(err, "Failed to query traces stats", map[string]interface{}{
+				"endpoint": "/api/stats",
+			})
+			http.Error(w, fmt.Sprintf("query error: %v", err), 500)
+			return
+		}
+		
+		var tracesStats map[string]interface{}
+		if len(tracesRows) > 0 {
+			row := tracesRows[0]
+			tracesStats = map[string]interface{}{
+				"total_traces":    getUint64(row, "total_traces"),
+				"total_spans":     getUint64(row, "total_spans"),
+				"error_rate":      getFloat64(row, "error_rate"),
+				"avg_duration_ms": getFloat64(row, "avg_duration_ms"),
+				"p50_duration_ms": getFloat64(row, "p50_duration_ms"),
+				"p95_duration_ms": getFloat64(row, "p95_duration_ms"),
+				"p99_duration_ms": getFloat64(row, "p99_duration_ms"),
+			}
+		} else {
+			tracesStats = map[string]interface{}{
+				"total_traces":    uint64(0),
+				"total_spans":     uint64(0),
+				"error_rate":      0.0,
+				"avg_duration_ms": 0.0,
+				"p50_duration_ms": 0.0,
+				"p95_duration_ms": 0.0,
+				"p99_duration_ms": 0.0,
+			}
+		}
+		
+		// Get traces by service
+		var serviceFilter string
+		if tenantFilter != "" {
+			serviceFilter = " WHERE " + tenantFilter + timeFilter
+		} else if timeFilter != "" {
+			serviceFilter = " WHERE 1=1" + timeFilter
+		} else {
+			serviceFilter = ""
+		}
+		
+		servicesQuery := `SELECT 
+			service,
+			count(DISTINCT trace_id) as traces,
+			count(*) as spans,
+			sum(CASE WHEN status = 'error' OR status = '0' THEN 1 ELSE 0 END) * 100.0 / greatest(count(*), 1) as error_rate
+			FROM opa.spans_min` + serviceFilter + `
+			GROUP BY service
+			ORDER BY traces DESC
+			LIMIT 20`
+		
+		servicesRows, _ := queryClient.Query(servicesQuery)
+		byService := make([]map[string]interface{}, 0)
+		for _, row := range servicesRows {
+			byService = append(byService, map[string]interface{}{
+				"service":    getString(row, "service"),
+				"traces":     getUint64(row, "traces"),
+				"spans":      getUint64(row, "spans"),
+				"error_rate": getFloat64(row, "error_rate"),
+			})
+		}
+		tracesStats["by_service"] = byService
+		
+		// Get agent internal stats
+		// Collect Prometheus metrics
+		gatherer := prometheus.DefaultGatherer
+		metricFamilies, err := gatherer.Gather()
+		var incomingTotal, droppedTotal float64
+		if err == nil {
+			for _, mf := range metricFamilies {
+				switch *mf.Name {
+				case "apm_agent_incoming_total":
+					if len(mf.Metric) > 0 {
+						incomingTotal = *mf.Metric[0].Counter.Value
+					}
+				case "apm_agent_dropped_total":
+					if len(mf.Metric) > 0 {
+						droppedTotal = *mf.Metric[0].Counter.Value
+					}
+				}
+			}
+		}
+		
+		agentStats := map[string]interface{}{
+			"queue_size": atomic.LoadInt64(&currentQueueSize),
+			"incoming_total": int64(incomingTotal),
+			"dropped_total":   int64(droppedTotal),
+		}
+		
+		// Get database size from ClickHouse system tables
+		dbSizeQuery := `SELECT 
+			database,
+			table,
+			sum(bytes) as size_bytes,
+			sum(rows) as rows
+			FROM system.parts
+			WHERE database = 'opa' AND active
+			GROUP BY database, table
+			ORDER BY size_bytes DESC`
+		
+		dbRows, err := queryClient.Query(dbSizeQuery)
+		var totalSizeBytes uint64 = 0
+		tables := make([]map[string]interface{}, 0)
+		
+		if err == nil {
+			for _, row := range dbRows {
+				sizeBytes := getUint64(row, "size_bytes")
+				rows := getUint64(row, "rows")
+				tableName := getString(row, "table")
+				
+				totalSizeBytes += sizeBytes
+				
+				// Format readable size
+				var sizeReadable string
+				if sizeBytes < 1024 {
+					sizeReadable = fmt.Sprintf("%d B", sizeBytes)
+				} else if sizeBytes < 1024*1024 {
+					sizeReadable = fmt.Sprintf("%.2f KB", float64(sizeBytes)/1024)
+				} else if sizeBytes < 1024*1024*1024 {
+					sizeReadable = fmt.Sprintf("%.2f MB", float64(sizeBytes)/(1024*1024))
+				} else {
+					sizeReadable = fmt.Sprintf("%.2f GB", float64(sizeBytes)/(1024*1024*1024))
+				}
+				
+				tables = append(tables, map[string]interface{}{
+					"name":          tableName,
+					"size_bytes":    sizeBytes,
+					"size_readable": sizeReadable,
+					"rows":         rows,
+				})
+			}
+		}
+		
+		// Format total size
+		var totalSizeReadable string
+		if totalSizeBytes < 1024 {
+			totalSizeReadable = fmt.Sprintf("%d B", totalSizeBytes)
+		} else if totalSizeBytes < 1024*1024 {
+			totalSizeReadable = fmt.Sprintf("%.2f KB", float64(totalSizeBytes)/1024)
+		} else if totalSizeBytes < 1024*1024*1024 {
+			totalSizeReadable = fmt.Sprintf("%.2f MB", float64(totalSizeBytes)/(1024*1024))
+		} else {
+			totalSizeReadable = fmt.Sprintf("%.2f GB", float64(totalSizeBytes)/(1024*1024*1024))
+		}
+		
+		databaseStats := map[string]interface{}{
+			"total_size_bytes":    totalSizeBytes,
+			"total_size_readable": totalSizeReadable,
+			"tables":              tables,
+		}
+		
+		// Combine all stats
+		stats := map[string]interface{}{
+			"traces":   tracesStats,
+			"agent":    agentStats,
+			"database": databaseStats,
+		}
+		
 		json.NewEncoder(w).Encode(stats)
 	})
 	
@@ -1276,77 +1522,146 @@ func main() {
 		
 		ctx, _ := ExtractTenantContext(r, queryClient)
 		
-		// Parse query parameters
-		service := r.URL.Query().Get("service")
-		status := r.URL.Query().Get("status")
-		language := r.URL.Query().Get("language")
-		framework := r.URL.Query().Get("framework")
-		version := r.URL.Query().Get("version")
-		timeFrom := r.URL.Query().Get("from")
-		timeTo := r.URL.Query().Get("to")
-		minDuration := r.URL.Query().Get("min_duration")
-		maxDuration := r.URL.Query().Get("max_duration")
-		scheme := r.URL.Query().Get("scheme")
-		host := r.URL.Query().Get("host")
-		uri := r.URL.Query().Get("uri")
-		queryString := r.URL.Query().Get("query_string")
-		sortBy := r.URL.Query().Get("sort")
-		if sortBy == "" {
-			sortBy = "time"
+	// Parse query parameters
+	service := r.URL.Query().Get("service")
+	status := r.URL.Query().Get("status")
+	language := r.URL.Query().Get("language")
+	framework := r.URL.Query().Get("framework")
+	version := r.URL.Query().Get("version")
+	timeFrom := r.URL.Query().Get("from")
+	timeTo := r.URL.Query().Get("to")
+	minDuration := r.URL.Query().Get("min_duration")
+	maxDuration := r.URL.Query().Get("max_duration")
+	scheme := r.URL.Query().Get("scheme")
+	host := r.URL.Query().Get("host")
+	uri := r.URL.Query().Get("uri")
+	queryString := r.URL.Query().Get("query_string")
+	filterQuery := r.URL.Query().Get("filter")
+	sortBy := r.URL.Query().Get("sort")
+	if sortBy == "" {
+		sortBy = "created_at" // Default to created_at instead of time
+	}
+	sortOrder := r.URL.Query().Get("order")
+	if sortOrder == "" {
+		sortOrder = "desc"
+	}
+	limit := r.URL.Query().Get("limit")
+	if limit == "" {
+		limit = "50"
+	}
+	offset := r.URL.Query().Get("offset")
+	if offset == "" {
+		offset = "0"
+	}
+	
+	// Parse filter query if provided
+	var filterAST *FilterAST
+	var filterErr error
+	if filterQuery != "" {
+		filterAST, filterErr = ParseFilterQuery(filterQuery)
+		if filterErr != nil {
+			LogWarn("Failed to parse filter query in traces endpoint", map[string]interface{}{
+				"filter": filterQuery,
+				"error":  filterErr.Error(),
+			})
+			http.Error(w, fmt.Sprintf("invalid filter query: %v", filterErr), 400)
+			return
 		}
-		sortOrder := r.URL.Query().Get("order")
-		if sortOrder == "" {
-			sortOrder = "desc"
-		}
-		limit := r.URL.Query().Get("limit")
-		if limit == "" {
-			limit = "50"
-		}
-		offset := r.URL.Query().Get("offset")
-		if offset == "" {
-			offset = "0"
+	}
+	
+	// Build query - use subquery to filter before aggregation
+	// If HTTP request filters or filter query are present, we need to join with spans_full to access tags
+	hasHttpFilters := scheme != "" || host != "" || uri != "" || queryString != ""
+	hasFilterQuery := filterAST != nil
+	needsFullJoin := hasHttpFilters || hasFilterQuery
+		
+	var baseQuery string
+	if needsFullJoin {
+		// Join spans_min with spans_full to access tags for HTTP filtering and filter query
+		baseQuery = "SELECT DISTINCT sm.trace_id, sm.service, sm.start_ts, sm.end_ts, sm.duration_ms, sm.status, sm.language, sm.language_version, sm.framework, sm.framework_version "
+		baseQuery += "FROM opa.spans_min sm "
+		baseQuery += "INNER JOIN opa.spans_full sf ON sm.trace_id = sf.trace_id AND sm.span_id = sf.span_id "
+		
+		// Build tenant filter
+		var tenantFilter string
+		if ctx.IsAllTenants() {
+			tenantFilter = "WHERE 1=1"
+		} else {
+			tenantFilter = fmt.Sprintf("WHERE (coalesce(nullif(sm.organization_id, ''), 'default-org') = '%s' AND coalesce(nullif(sm.project_id, ''), 'default-project') = '%s')",
+				escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID))
 		}
 		
-		// Build query - use subquery to filter before aggregation
-		// If HTTP request filters are present, we need to join with spans_full to access tags
-		hasHttpFilters := scheme != "" || host != "" || uri != "" || queryString != ""
-		
-		var baseQuery string
-		if hasHttpFilters {
-			// Join spans_min with spans_full to access tags for HTTP filtering
-			baseQuery = "SELECT DISTINCT sm.trace_id, sm.service, sm.start_ts, sm.end_ts, sm.duration_ms, sm.status, sm.language, sm.language_version, sm.framework, sm.framework_version "
-			baseQuery += "FROM opa.spans_min sm "
-			baseQuery += "INNER JOIN opa.spans_full sf ON sm.trace_id = sf.trace_id AND sm.span_id = sf.span_id "
+		// Add filter query if provided
+		if hasFilterQuery {
+			var filterWhere string
 			if ctx.IsAllTenants() {
-				baseQuery += "WHERE 1=1"
+				filterWhere, filterErr = BuildClickHouseWhere(filterAST, "")
 			} else {
-				baseQuery += fmt.Sprintf("WHERE (coalesce(nullif(sm.organization_id, ''), 'default-org') = '%s' AND coalesce(nullif(sm.project_id, ''), 'default-project') = '%s')",
-					escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID))
+				filterWhere, filterErr = BuildClickHouseWhere(filterAST, tenantFilter)
+			}
+			if filterErr != nil {
+				LogError(filterErr, "Failed to build filter WHERE clause in traces", map[string]interface{}{
+					"filter": filterQuery,
+				})
+				http.Error(w, fmt.Sprintf("failed to build filter: %v", filterErr), 500)
+				return
 			}
 			
-			// Add HTTP request filters using JSONExtractString
-			if scheme != "" {
-				baseQuery += fmt.Sprintf(" AND JSONExtractString(sf.tags, 'http_request', 'scheme') = '%s'", strings.ReplaceAll(scheme, "'", "''"))
+			// Extract the WHERE clause part
+			if strings.HasPrefix(filterWhere, " WHERE ") {
+				filterWhere = strings.TrimPrefix(filterWhere, " WHERE ")
 			}
-			if host != "" {
-				baseQuery += fmt.Sprintf(" AND JSONExtractString(sf.tags, 'http_request', 'host') LIKE '%%%s%%'", strings.ReplaceAll(host, "'", "''"))
-			}
-			if uri != "" {
-				baseQuery += fmt.Sprintf(" AND JSONExtractString(sf.tags, 'http_request', 'uri') LIKE '%%%s%%'", strings.ReplaceAll(uri, "'", "''"))
-			}
-			if queryString != "" {
-				baseQuery += fmt.Sprintf(" AND JSONExtractString(sf.tags, 'http_request', 'query_string') LIKE '%%%s%%'", strings.ReplaceAll(queryString, "'", "''"))
-			}
-		} else {
-			// No HTTP filters, use simpler query on spans_min only
-			baseQuery = "SELECT trace_id, service, start_ts, end_ts, duration_ms, status, language, language_version, framework, framework_version "
-			if ctx.IsAllTenants() {
-				baseQuery += "FROM opa.spans_min WHERE 1=1"
-			} else {
-				baseQuery += fmt.Sprintf("FROM opa.spans_min WHERE (coalesce(nullif(organization_id, ''), 'default-org') = '%s' AND coalesce(nullif(project_id, ''), 'default-project') = '%s')",
-					escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID))
-			}
+			// Replace field references to use sf. prefix for spans_full fields
+			filterWhere = adaptFilterForJoin(filterWhere, "sf")
+			tenantFilter = tenantFilter + " AND (" + filterWhere + ")"
 		}
+		
+		baseQuery += tenantFilter
+		
+		// Add HTTP request filters using JSONExtractString
+		if scheme != "" {
+			baseQuery += fmt.Sprintf(" AND JSONExtractString(sf.tags, 'http_request', 'scheme') = '%s'", strings.ReplaceAll(scheme, "'", "''"))
+		}
+		if host != "" {
+			baseQuery += fmt.Sprintf(" AND JSONExtractString(sf.tags, 'http_request', 'host') LIKE '%%%s%%'", strings.ReplaceAll(host, "'", "''"))
+		}
+		if uri != "" {
+			baseQuery += fmt.Sprintf(" AND JSONExtractString(sf.tags, 'http_request', 'uri') LIKE '%%%s%%'", strings.ReplaceAll(uri, "'", "''"))
+		}
+		if queryString != "" {
+			baseQuery += fmt.Sprintf(" AND JSONExtractString(sf.tags, 'http_request', 'query_string') LIKE '%%%s%%'", strings.ReplaceAll(queryString, "'", "''"))
+		}
+	} else {
+		// No HTTP filters or filter query, use simpler query on spans_min only
+		baseQuery = "SELECT trace_id, service, start_ts, end_ts, duration_ms, status, language, language_version, framework, framework_version "
+		
+		// Build tenant filter
+		var tenantFilter string
+		if ctx.IsAllTenants() {
+			tenantFilter = "WHERE 1=1"
+		} else {
+			tenantFilter = fmt.Sprintf("WHERE (coalesce(nullif(organization_id, ''), 'default-org') = '%s' AND coalesce(nullif(project_id, ''), 'default-project') = '%s')",
+				escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID))
+		}
+		
+		// Add filter query if provided (but no join needed - filter should work on spans_min fields)
+		if hasFilterQuery {
+			filterWhere, filterErr := BuildClickHouseWhere(filterAST, tenantFilter)
+			if filterErr != nil {
+				LogError(filterErr, "Failed to build filter WHERE clause in traces", map[string]interface{}{
+					"filter": filterQuery,
+				})
+				http.Error(w, fmt.Sprintf("failed to build filter: %v", filterErr), 500)
+				return
+			}
+			if strings.HasPrefix(filterWhere, " WHERE ") {
+				filterWhere = strings.TrimPrefix(filterWhere, " WHERE ")
+			}
+			tenantFilter = filterWhere
+		}
+		
+		baseQuery += "FROM opa.spans_min " + tenantFilter
+	}
 		
 		// Add other filters
 		if service != "" {
@@ -1404,22 +1719,27 @@ func main() {
 		// span_count is simply COUNT(*) since all spans are pre-constructed and stored
 		// No need for complex JOIN or stack calculation - each span is stored as a separate row
 		var query string
-		if hasHttpFilters {
+		if needsFullJoin {
 			// baseQuery uses sm. prefix for HTTP filters
 			query = "SELECT sm.trace_id, sm.service, min(sm.start_ts) as start_ts, max(sm.end_ts) as end_ts, "
-			query += "sum(sm.duration_ms) as duration_ms, count(*) as span_count, "
+			query += "toUnixTimestamp64Milli(max(sm.end_ts)) - toUnixTimestamp64Milli(min(sm.start_ts)) as duration_ms, count(*) as span_count, "
 			query += "any(sm.status) as status, any(sm.language) as language, any(sm.language_version) as language_version, "
 			query += "any(sm.framework) as framework, any(sm.framework_version) as framework_version "
 			query += "FROM (" + baseQuery + ") sm "
 			query += "GROUP BY sm.trace_id, sm.service"
 		} else {
-			// baseQuery doesn't use prefix
-			query = "SELECT trace_id, service, min(start_ts) as start_ts, max(end_ts) as end_ts, "
-			query += "sum(duration_ms) as duration_ms, count(*) as span_count, "
+			// baseQuery doesn't use prefix - use subquery to avoid nested aggregates
+			query = "SELECT trace_id, service, start_ts, end_ts, "
+			query += "toUnixTimestamp64Milli(end_ts) - toUnixTimestamp64Milli(start_ts) as duration_ms, span_count, "
+			query += "status, language, language_version, framework, framework_version "
+			query += "FROM ("
+			query += "SELECT trace_id, service, min(start_ts) as start_ts, max(end_ts) as end_ts, "
+			query += "count(*) as span_count, "
 			query += "any(status) as status, any(language) as language, any(language_version) as language_version, "
 			query += "any(framework) as framework, any(framework_version) as framework_version "
 			query += "FROM (" + baseQuery + ") "
 			query += "GROUP BY trace_id, service"
+			query += ")"
 		}
 		
 		// Apply duration filters after grouping
@@ -1435,10 +1755,15 @@ func main() {
 		}
 		
 		// Sorting
-		if sortBy == "time" {
+		if sortBy == "time" || sortBy == "created_at" {
 			query += fmt.Sprintf(" ORDER BY start_ts %s", strings.ToUpper(sortOrder))
 		} else if sortBy == "duration" {
 			query += fmt.Sprintf(" ORDER BY duration_ms %s", strings.ToUpper(sortOrder))
+		} else if sortBy == "service" {
+			query += fmt.Sprintf(" ORDER BY service %s", strings.ToUpper(sortOrder))
+		} else {
+			// Default to created_at DESC
+			query += " ORDER BY start_ts DESC"
 		}
 		
 		// Pagination
@@ -1459,6 +1784,7 @@ func main() {
 				"trace_id":   getString(row, "trace_id"),
 				"service":    getString(row, "service"),
 				"start_ts":    getString(row, "start_ts"),
+				"created_at":  getString(row, "start_ts"), // Map start_ts to created_at for consistency
 				"end_ts":      getString(row, "end_ts"),
 				"duration_ms": getFloat64(row, "duration_ms"),
 				"span_count":  getUint64(row, "span_count"),
@@ -2611,6 +2937,7 @@ func main() {
 			})
 		}
 		httpDepsMap := make(map[string]map[string]interface{}) // key: "service->url"
+		curlDepsMap := make(map[string]map[string]interface{}) // key: "service->url" for curl calls
 		
 		for _, row := range httpRows {
 			fromService := getString(row, "service")
@@ -2625,6 +2952,12 @@ func main() {
 			}
 			
 			for _, req := range httpArray {
+				// Check if this is a curl call
+				isCurl := false
+				if reqType, ok := req["type"].(string); ok && reqType == "curl" {
+					isCurl = true
+				}
+				
 				url := ""
 				if u, ok := req["url"].(string); ok && u != "" {
 					url = u
@@ -2657,8 +2990,16 @@ func main() {
 					}
 				}
 				
+				// Use separate maps for curl vs regular HTTP
+				var targetMap map[string]map[string]interface{}
+				if isCurl {
+					targetMap = curlDepsMap
+				} else {
+					targetMap = httpDepsMap
+				}
+				
 				key := fmt.Sprintf("%s->%s", fromService, baseURL)
-				dep, exists := httpDepsMap[key]
+				dep, exists := targetMap[key]
 				if !exists {
 					dep = map[string]interface{}{
 						"from_service": fromService,
@@ -2668,8 +3009,9 @@ func main() {
 						"error_count":  int64(0),
 						"total_bytes_sent": int64(0),
 						"total_bytes_received": int64(0),
+						"is_curl":      isCurl,
 					}
-					httpDepsMap[key] = dep
+					targetMap[key] = dep
 				}
 				
 				dep["call_count"] = dep["call_count"].(int64) + 1
@@ -2739,6 +3081,47 @@ func main() {
 				"bytes_received":  dep["total_bytes_received"],
 				"health_status":   healthStatus,
 				"dependency_type": "http",
+				"dependency_target": target,
+			})
+		}
+		
+		// Convert curl dependencies to edges (with curl type)
+		for _, dep := range curlDepsMap {
+			fromService := dep["from_service"].(string)
+			target := dep["target"].(string)
+			callCount := dep["call_count"].(int64)
+			if callCount == 0 {
+				continue
+			}
+			
+			services[fromService] = true
+			externalDeps[target] = true
+			
+			avgLatency := dep["total_duration"].(float64) / float64(callCount)
+			errorRate := float64(dep["error_count"].(int64)) / float64(callCount) * 100.0
+			healthStatus := calculateHealthStatus(errorRate, avgLatency)
+			
+			successRate := 100.0 - errorRate
+			if successRate < 0 {
+				successRate = 0
+			}
+
+			edges = append(edges, map[string]interface{}{
+				"from":            fromService,
+				"to":              target,
+				"avg_latency_ms":  avgLatency,
+				"min_latency_ms":  avgLatency,
+				"max_latency_ms":  avgLatency,
+				"p95_latency_ms":  avgLatency,
+				"p99_latency_ms":  avgLatency,
+				"error_rate":      errorRate,
+				"success_rate":   successRate,
+				"call_count":      callCount,
+				"throughput":      0.0,
+				"bytes_sent":      dep["total_bytes_sent"],
+				"bytes_received":  dep["total_bytes_received"],
+				"health_status":   healthStatus,
+				"dependency_type": "curl",
 				"dependency_target": target,
 			})
 		}
@@ -2884,10 +3267,22 @@ func main() {
 		}
 
 		// Create nodes for external dependencies
+		// First, check edges to determine if a dependency is curl
+		curlTargets := make(map[string]bool)
+		for _, edge := range edges {
+			if depType, ok := edge["dependency_type"].(string); ok && depType == "curl" {
+				if to, ok := edge["to"].(string); ok {
+					curlTargets[to] = true
+				}
+			}
+		}
+		
 		for extDep := range externalDeps {
-			// Determine dependency type from the target name
+			// Determine dependency type from the target name and edge types
 			depType := "external"
-			if strings.HasPrefix(extDep, "db:") {
+			if curlTargets[extDep] {
+				depType = "curl"
+			} else if strings.HasPrefix(extDep, "db:") {
 				depType = "database"
 			} else if strings.HasPrefix(extDep, "http://") || strings.HasPrefix(extDep, "https://") {
 				depType = "http"
@@ -3572,75 +3967,127 @@ func main() {
 			return
 		}
 		
-		ctx, _ := ExtractTenantContext(r, queryClient)
-		timeFrom := r.URL.Query().Get("from")
-		timeTo := r.URL.Query().Get("to")
-		serviceFilter := r.URL.Query().Get("service")
-		limit := r.URL.Query().Get("limit")
-		offset := r.URL.Query().Get("offset")
-		
-		if limit == "" {
-			limit = "100"
+	ctx, _ := ExtractTenantContext(r, queryClient)
+	timeFrom := r.URL.Query().Get("from")
+	timeTo := r.URL.Query().Get("to")
+	serviceFilter := r.URL.Query().Get("service")
+	filterQuery := r.URL.Query().Get("filter")
+	limit := r.URL.Query().Get("limit")
+	offset := r.URL.Query().Get("offset")
+	sortBy := r.URL.Query().Get("sort")
+	if sortBy == "" {
+		sortBy = "last_created_at" // Default to last_created_at for grouped items
+	}
+	sortOrder := r.URL.Query().Get("order")
+	if sortOrder == "" {
+		sortOrder = "desc"
+	}
+	
+	if limit == "" {
+		limit = "100"
+	}
+	limitInt, _ := strconv.Atoi(limit)
+	if limitInt > 500 {
+		limitInt = 500
+	}
+	if limitInt < 1 {
+		limitInt = 100
+	}
+	
+	offsetInt := 0
+	if offset != "" {
+		offsetInt, _ = strconv.Atoi(offset)
+		if offsetInt < 0 {
+			offsetInt = 0
 		}
-		limitInt, _ := strconv.Atoi(limit)
-		if limitInt > 500 {
-			limitInt = 500
-		}
-		if limitInt < 1 {
-			limitInt = 100
-		}
-		
-		offsetInt := 0
-		if offset != "" {
-			offsetInt, _ = strconv.Atoi(offset)
-			if offsetInt < 0 {
-				offsetInt = 0
+	}
+	
+	// Build base WHERE clause
+	var baseWhere string
+	if ctx.IsAllTenants() {
+		baseWhere = "WHERE ((http != '' AND http != '[]' AND http != 'null') OR (tags != '' AND tags != '{}' AND tags LIKE '%%http_request%%'))"
+	} else {
+		baseWhere = fmt.Sprintf("WHERE (coalesce(nullif(organization_id, ''), 'default-org') = '%s' AND coalesce(nullif(project_id, ''), 'default-project') = '%s') AND ((http != '' AND http != '[]' AND http != 'null') OR (tags != '' AND tags != '{}' AND tags LIKE '%%http_request%%'))",
+			escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID))
+	}
+	
+		// Parse and apply filter query if provided
+		if filterQuery != "" {
+			filterAST, err := ParseFilterQuery(filterQuery)
+			if err != nil {
+				LogWarn("Failed to parse filter query", map[string]interface{}{
+					"filter": filterQuery,
+					"error":  err.Error(),
+				})
+				http.Error(w, fmt.Sprintf("invalid filter query: %v", err), 400)
+				return
+			}
+			
+			if filterAST != nil {
+				// Build tenant filter for filter query builder
+				var tenantFilterForFilter string
+				if ctx.IsAllTenants() {
+					tenantFilterForFilter = ""
+				} else {
+					orgID := ctx.OrganizationID
+					if orgID == "" {
+						orgID = "default-org"
+					}
+					projID := ctx.ProjectID
+					if projID == "" {
+						projID = "default-project"
+					}
+					tenantFilterForFilter = fmt.Sprintf("(coalesce(nullif(organization_id, ''), 'default-org') = '%s' AND coalesce(nullif(project_id, ''), 'default-project') = '%s')",
+						escapeSQL(orgID), escapeSQL(projID))
+				}
+				
+				filterWhere, err := BuildClickHouseWhere(filterAST, tenantFilterForFilter)
+				if err != nil {
+					LogError(err, "Failed to build filter WHERE clause", map[string]interface{}{
+						"filter":         filterQuery,
+						"tenantFilter":   tenantFilterForFilter,
+						"organizationID": ctx.OrganizationID,
+						"projectID":      ctx.ProjectID,
+					})
+					http.Error(w, fmt.Sprintf("failed to build filter: %v", err), 500)
+					return
+				}
+				
+				// Combine base WHERE with filter WHERE
+				if strings.HasPrefix(filterWhere, " WHERE ") {
+					filterWhere = strings.TrimPrefix(filterWhere, " WHERE ")
+				}
+				if filterWhere != "" {
+					baseWhere = baseWhere + " AND (" + filterWhere + ")"
+				}
 			}
 		}
-		
-		// Build query to get HTTP requests
-		// Include both http field (outgoing requests) and tags field (incoming requests)
-		var query string
-		if ctx.IsAllTenants() {
-			query = fmt.Sprintf(`SELECT 
-				http,
-				tags,
-				net,
-				service,
-				start_ts,
-				duration_ms,
-				status,
-				trace_id,
-				span_id
-				FROM opa.spans_full 
-				WHERE (http != '' AND http != '[]' AND http != 'null') OR (tags != '' AND tags != '{}' AND tags LIKE '%%http_request%%')`)
-		} else {
-			query = fmt.Sprintf(`SELECT 
-				http,
-				tags,
-				net,
-				service,
-				start_ts,
-				duration_ms,
-				status,
-				trace_id,
-				span_id
-				FROM opa.spans_full 
-				WHERE (coalesce(nullif(organization_id, ''), 'default-org') = '%s' AND coalesce(nullif(project_id, ''), 'default-project') = '%s') 
-					AND ((http != '' AND http != '[]' AND http != 'null') OR (tags != '' AND tags != '{}' AND tags LIKE '%%http_request%%'))`,
-				escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID))
-		}
-		
-		if serviceFilter != "" {
-			query += fmt.Sprintf(" AND service = '%s'", escapeSQL(serviceFilter))
-		}
-		
-		if timeFrom != "" {
-			query += fmt.Sprintf(" AND start_ts >= '%s'", escapeSQL(timeFrom))
-		}
-		if timeTo != "" {
-			query += fmt.Sprintf(" AND start_ts <= '%s'", escapeSQL(timeTo))
-		}
+	
+	// Build query to get HTTP requests
+	// Include both http field (outgoing requests) and tags field (incoming requests)
+	query := fmt.Sprintf(`SELECT 
+		http,
+		tags,
+		net,
+		service,
+		start_ts,
+		duration_ms,
+		status,
+		trace_id,
+		span_id
+		FROM opa.spans_full 
+		%s`, baseWhere)
+	
+	if serviceFilter != "" {
+		query += fmt.Sprintf(" AND service = '%s'", escapeSQL(serviceFilter))
+	}
+	
+	if timeFrom != "" {
+		query += fmt.Sprintf(" AND start_ts >= '%s'", escapeSQL(timeFrom))
+	}
+	if timeTo != "" {
+		query += fmt.Sprintf(" AND start_ts <= '%s'", escapeSQL(timeTo))
+	}
 		
 		// Apply pagination - we'll fetch more rows than needed to aggregate properly
 		// Since we're grouping, we need to fetch all matching rows, aggregate, then paginate
@@ -3670,12 +4117,13 @@ func main() {
 			MaxDuration      float64
 			StatusCodeCounts map[int]int64 // Track status code frequencies
 			MostCommonStatus int           // Most common status code
+			LastCreatedAt    string        // Most recent start_ts in the group
 		}
 		httpCallsMap := make(map[string]*HttpCallStats)
 		totalCalls := int64(0)
 		
 		// Helper function to process HTTP requests from either http field or tags
-		processHttpRequestFromField := func(req map[string]interface{}, httpCallsMap map[string]*HttpCallStats, serviceName string, totalCalls *int64) {
+		processHttpRequestFromField := func(req map[string]interface{}, httpCallsMap map[string]*HttpCallStats, serviceName string, totalCalls *int64, startTs string) {
 			requestURL := ""
 			if u, ok := req["url"].(string); ok && u != "" {
 				requestURL = u
@@ -3729,8 +4177,16 @@ func main() {
 					MaxDuration:     0.0,
 					StatusCodeCounts: make(map[int]int64),
 					MostCommonStatus: 0,
+					LastCreatedAt:    "",
 				}
 				httpCallsMap[key] = call
+			}
+			
+			// Update last_created_at if this start_ts is more recent
+			if startTs != "" {
+				if call.LastCreatedAt == "" || startTs > call.LastCreatedAt {
+					call.LastCreatedAt = startTs
+				}
 			}
 			
 			call.CallCount++
@@ -3797,6 +4253,7 @@ func main() {
 			serviceName := getString(row, "service")
 			durationMs := getFloat64(row, "duration_ms")
 			spanStatus := getString(row, "status")
+			startTs := getString(row, "start_ts")
 			
 			// Extract net field for fallback bytes
 			var netBytesSent, netBytesRecv int64
@@ -3820,7 +4277,7 @@ func main() {
 				var httpRequests []map[string]interface{}
 				if err := json.Unmarshal([]byte(httpData), &httpRequests); err == nil {
 					for _, req := range httpRequests {
-						processHttpRequestFromField(req, httpCallsMap, serviceName, &totalCalls)
+						processHttpRequestFromField(req, httpCallsMap, serviceName, &totalCalls, startTs)
 					}
 				}
 			}
@@ -3918,7 +4375,7 @@ func main() {
 								req["error"] = "span_error"
 							}
 							
-							processHttpRequestFromField(req, httpCallsMap, serviceName, &totalCalls)
+							processHttpRequestFromField(req, httpCallsMap, serviceName, &totalCalls, startTs)
 						}
 					}
 				}
@@ -3959,14 +4416,53 @@ func main() {
 				"total_bytes_sent":   call.TotalBytesSent,
 				"total_bytes_received": call.TotalBytesRecv,
 				"status_code":       statusCode, // Include actual status code
+				"last_created_at":    call.LastCreatedAt,
 			})
 		}
 		
-		// Sort by call count descending
+		// Sorting
 		sort.Slice(httpCalls, func(i, j int) bool {
-			ci, _ := httpCalls[i]["call_count"].(int64)
-			cj, _ := httpCalls[j]["call_count"].(int64)
-			return ci > cj
+			if sortBy == "last_created_at" || sortBy == "created_at" {
+				ti, _ := httpCalls[i]["last_created_at"].(string)
+				tj, _ := httpCalls[j]["last_created_at"].(string)
+				if sortOrder == "asc" {
+					return ti < tj
+				}
+				return ti > tj
+			} else if sortBy == "call_count" || sortBy == "count" {
+				ci, _ := httpCalls[i]["call_count"].(int64)
+				cj, _ := httpCalls[j]["call_count"].(int64)
+				if sortOrder == "asc" {
+					return ci < cj
+				}
+				return ci > cj
+			} else if sortBy == "avg_duration" || sortBy == "duration" {
+				di, _ := httpCalls[i]["avg_duration"].(float64)
+				dj, _ := httpCalls[j]["avg_duration"].(float64)
+				if sortOrder == "asc" {
+					return di < dj
+				}
+				return di > dj
+			} else if sortBy == "error_count" || sortBy == "errors" {
+				ei, _ := httpCalls[i]["error_count"].(int64)
+				ej, _ := httpCalls[j]["error_count"].(int64)
+				if sortOrder == "asc" {
+					return ei < ej
+				}
+				return ei > ej
+			} else if sortBy == "error_rate" || sortBy == "rate" {
+				ri, _ := httpCalls[i]["error_rate"].(float64)
+				rj, _ := httpCalls[j]["error_rate"].(float64)
+				if sortOrder == "asc" {
+					return ri < rj
+				}
+				return ri > rj
+			} else {
+				// Default to last_created_at DESC
+				ti, _ := httpCalls[i]["last_created_at"].(string)
+				tj, _ := httpCalls[j]["last_created_at"].(string)
+				return ti > tj
+			}
 		})
 		
 		// Apply pagination
@@ -4065,13 +4561,252 @@ func main() {
 			})
 		}
 		
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"frameworks": frameworks,
-		})
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"frameworks": frameworks,
 	})
+})
+
+// Filter suggestions endpoints
+mux.HandleFunc("/api/filter-suggestions/keys", func(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
 	
-	// Get service metadata
-	mux.HandleFunc("/api/services/metadata", func(w http.ResponseWriter, r *http.Request) {
+	prefix := r.URL.Query().Get("prefix")
+	context := r.URL.Query().Get("context")
+	
+	// Define all available filter keys with categories
+	allKeys := []map[string]interface{}{
+		// Span-level fields
+		{"key": "service", "category": "Span", "type": "string"},
+		{"key": "name", "category": "Span", "type": "string"},
+		{"key": "status", "category": "Span", "type": "string"},
+		{"key": "trace_id", "category": "Span", "type": "string"},
+		{"key": "span_id", "category": "Span", "type": "string"},
+		{"key": "parent_id", "category": "Span", "type": "string"},
+		{"key": "duration_ms", "category": "Span", "type": "number"},
+		{"key": "cpu_ms", "category": "Span", "type": "number"},
+		{"key": "start_ts", "category": "Span", "type": "datetime"},
+		{"key": "end_ts", "category": "Span", "type": "datetime"},
+		{"key": "url_scheme", "category": "Span", "type": "string"},
+		{"key": "url_host", "category": "Span", "type": "string"},
+		{"key": "url_path", "category": "Span", "type": "string"},
+		{"key": "language", "category": "Span", "type": "string"},
+		{"key": "language_version", "category": "Span", "type": "string"},
+		{"key": "framework", "category": "Span", "type": "string"},
+		{"key": "framework_version", "category": "Span", "type": "string"},
+		
+		// HTTP fields (from http array or tags.http_request)
+		{"key": "http.method", "category": "HTTP", "type": "string"},
+		{"key": "http.url", "category": "HTTP", "type": "string"},
+		{"key": "http.uri", "category": "HTTP", "type": "string"},
+		{"key": "http.request_uri", "category": "HTTP", "type": "string"},
+		{"key": "http.status_code", "category": "HTTP", "type": "number"},
+		{"key": "http.duration_ms", "category": "HTTP", "type": "number"},
+		{"key": "http.bytes_sent", "category": "HTTP", "type": "number"},
+		{"key": "http.bytes_received", "category": "HTTP", "type": "number"},
+		{"key": "http.request_size", "category": "HTTP", "type": "number"},
+		{"key": "http.response_size", "category": "HTTP", "type": "number"},
+		{"key": "http.query_string", "category": "HTTP", "type": "string"},
+		
+		// Tags fields (nested JSON)
+		{"key": "tags.http_request.method", "category": "Tags", "type": "string"},
+		{"key": "tags.http_request.url", "category": "Tags", "type": "string"},
+		{"key": "tags.http_request.uri", "category": "Tags", "type": "string"},
+		{"key": "tags.http_request.request_uri", "category": "Tags", "type": "string"},
+		{"key": "tags.http_request.query_string", "category": "Tags", "type": "string"},
+		{"key": "tags.http_response.status_code", "category": "Tags", "type": "number"},
+		{"key": "tags.http_response.response_size", "category": "Tags", "type": "number"},
+		
+		// SQL fields
+		{"key": "sql.query", "category": "SQL", "type": "string"},
+		{"key": "sql.duration_ms", "category": "SQL", "type": "number"},
+		{"key": "sql.rows_affected", "category": "SQL", "type": "number"},
+		{"key": "sql.error", "category": "SQL", "type": "string"},
+		
+		// Network fields
+		{"key": "net.bytes_sent", "category": "Network", "type": "number"},
+		{"key": "net.bytes_received", "category": "Network", "type": "number"},
+	}
+	
+	// Filter by prefix if provided
+	var filteredKeys []map[string]interface{}
+	prefixLower := strings.ToLower(prefix)
+	
+	for _, key := range allKeys {
+		keyStr := key["key"].(string)
+		keyStrLower := strings.ToLower(keyStr)
+		
+		// If prefix is empty, show all keys
+		if prefix == "" {
+			// Filter by context if provided
+			if context == "" || strings.HasPrefix(keyStr, context) {
+				filteredKeys = append(filteredKeys, key)
+			}
+			continue
+		}
+		
+		// Check if prefix matches from start (exact prefix match)
+		if strings.HasPrefix(keyStrLower, prefixLower) {
+			// Filter by context if provided
+			if context == "" || strings.HasPrefix(keyStr, context) {
+				filteredKeys = append(filteredKeys, key)
+			}
+			continue
+		}
+		
+		// Check if prefix matches any part of the key (partial match)
+		// For example, "ser" should match "service"
+		// Split key by dots and check each segment
+		keyParts := strings.Split(keyStrLower, ".")
+		prefixParts := strings.Split(prefixLower, ".")
+		
+		// If prefix contains a dot, match the prefix parts
+		if len(prefixParts) > 1 {
+			// Prefix like "sql." - match keys starting with "sql."
+			if len(keyParts) >= len(prefixParts) {
+				matches := true
+				for i := 0; i < len(prefixParts); i++ {
+					if !strings.HasPrefix(keyParts[i], prefixParts[i]) {
+						matches = false
+						break
+					}
+				}
+				if matches {
+					// Filter by context if provided
+					if context == "" || strings.HasPrefix(keyStr, context) {
+						filteredKeys = append(filteredKeys, key)
+					}
+					continue
+				}
+			}
+		} else {
+			// Single word prefix like "ser" - check if it matches any part of the key
+			// Check if prefix is contained in any part of the key
+			for _, part := range keyParts {
+				if strings.HasPrefix(part, prefixLower) {
+					// Filter by context if provided
+					if context == "" || strings.HasPrefix(keyStr, context) {
+						filteredKeys = append(filteredKeys, key)
+					}
+					break
+				}
+			}
+		}
+	}
+	
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"keys": filteredKeys,
+	})
+})
+
+mux.HandleFunc("/api/filter-suggestions/values", func(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	
+	key := r.URL.Query().Get("key")
+	prefix := r.URL.Query().Get("prefix")
+	limitStr := r.URL.Query().Get("limit")
+	limit := 50
+	if limitStr != "" {
+		if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 200 {
+			limit = l
+		}
+	}
+	
+	if key == "" {
+		http.Error(w, "key parameter is required", 400)
+		return
+	}
+	
+	ctx, _ := ExtractTenantContext(r, queryClient)
+	
+	// Build tenant filter
+	var tenantFilter string
+	if ctx.IsAllTenants() {
+		tenantFilter = ""
+	} else {
+		tenantFilter = fmt.Sprintf(" AND (coalesce(nullif(organization_id, ''), 'default-org') = '%s' AND coalesce(nullif(project_id, ''), 'default-project') = '%s')",
+			escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID))
+	}
+	
+	var query string
+	var values []string
+	
+	// Handle different field types
+	if key == "service" {
+		query = fmt.Sprintf(`SELECT DISTINCT service as value FROM opa.spans_min WHERE service != ''%s ORDER BY service LIMIT %d`, tenantFilter, limit)
+	} else if key == "status" {
+		query = fmt.Sprintf(`SELECT DISTINCT status as value FROM opa.spans_min WHERE status != ''%s ORDER BY value LIMIT %d`, tenantFilter, limit)
+	} else if key == "name" {
+		query = fmt.Sprintf(`SELECT DISTINCT name as value FROM opa.spans_min WHERE name != ''%s ORDER BY value LIMIT %d`, tenantFilter, limit)
+	} else if key == "language" {
+		query = fmt.Sprintf(`SELECT DISTINCT language as value FROM opa.spans_min WHERE language != ''%s ORDER BY value LIMIT %d`, tenantFilter, limit)
+	} else if key == "framework" {
+		query = fmt.Sprintf(`SELECT DISTINCT framework as value FROM opa.spans_min WHERE framework != '' AND framework IS NOT NULL%s ORDER BY value LIMIT %d`, tenantFilter, limit)
+	} else if strings.HasPrefix(key, "tags.http_request.") {
+		// Extract nested field name
+		fieldName := strings.TrimPrefix(key, "tags.http_request.")
+		query = fmt.Sprintf(`SELECT DISTINCT JSONExtractString(tags, 'http_request', '%s') as value 
+			FROM opa.spans_full 
+			WHERE tags != '' AND tags != '{}' AND JSONExtractString(tags, 'http_request', '%s') != ''%s 
+			ORDER BY value LIMIT %d`,
+			escapeSQL(fieldName), escapeSQL(fieldName), tenantFilter, limit)
+	} else if strings.HasPrefix(key, "tags.http_response.") {
+		fieldName := strings.TrimPrefix(key, "tags.http_response.")
+		query = fmt.Sprintf(`SELECT DISTINCT JSONExtractString(tags, 'http_response', '%s') as value 
+			FROM opa.spans_full 
+			WHERE tags != '' AND tags != '{}' AND JSONExtractString(tags, 'http_response', '%s') != ''%s 
+			ORDER BY value LIMIT %d`,
+			escapeSQL(fieldName), escapeSQL(fieldName), tenantFilter, limit)
+	} else if strings.HasPrefix(key, "http.") {
+		// For HTTP fields in the http array, we need to extract from JSON
+		fieldName := strings.TrimPrefix(key, "http.")
+		query = fmt.Sprintf(`SELECT DISTINCT JSONExtractString(http_item, '%s') as value 
+			FROM opa.spans_full 
+			ARRAY JOIN JSONExtractArrayRaw(http) as http_item
+			WHERE http != '' AND http != '[]' AND http != 'null' AND JSONExtractString(http_item, '%s') != ''%s 
+			ORDER BY value LIMIT %d`,
+			escapeSQL(fieldName), escapeSQL(fieldName), tenantFilter, limit)
+	} else {
+		// Default: try to get from spans_min or spans_full
+		query = fmt.Sprintf(`SELECT DISTINCT %s as value FROM opa.spans_min WHERE %s IS NOT NULL AND %s != ''%s ORDER BY value LIMIT %d`,
+			escapeSQL(key), escapeSQL(key), escapeSQL(key), tenantFilter, limit)
+	}
+	
+	rows, err := queryClient.Query(query)
+	if err != nil {
+		// If query fails, return empty array instead of error
+		LogWarn("Filter value query failed", map[string]interface{}{
+			"key": key,
+			"error": err.Error(),
+		})
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"values": []string{},
+		})
+		return
+	}
+	
+	for _, row := range rows {
+		value := getString(row, "value")
+		if value != "" {
+			// Filter by prefix if provided
+			if prefix == "" || strings.HasPrefix(strings.ToLower(value), strings.ToLower(prefix)) {
+				values = append(values, value)
+			}
+		}
+	}
+	
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"values": values,
+	})
+})
+
+// Get service metadata
+mux.HandleFunc("/api/services/metadata", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "GET" {
 			http.Error(w, "method not allowed", 405)
 			return
@@ -4235,60 +4970,129 @@ func main() {
 			return
 		}
 		
-		ctx, _ := ExtractTenantContext(r, queryClient)
-		service := r.URL.Query().Get("service")
-		timeFrom := r.URL.Query().Get("from")
-		timeTo := r.URL.Query().Get("to")
-		minDuration := r.URL.Query().Get("min_duration")
-		limit := r.URL.Query().Get("limit")
-		if limit == "" {
-			limit = "100"
+	ctx, _ := ExtractTenantContext(r, queryClient)
+	service := r.URL.Query().Get("service")
+	timeFrom := r.URL.Query().Get("from")
+	timeTo := r.URL.Query().Get("to")
+	minDuration := r.URL.Query().Get("min_duration")
+	filterQuery := r.URL.Query().Get("filter")
+	limit := r.URL.Query().Get("limit")
+	offset := r.URL.Query().Get("offset")
+	sortBy := r.URL.Query().Get("sort")
+	if sortBy == "" {
+		sortBy = "last_created_at" // Default to last_created_at for grouped items
+	}
+	sortOrder := r.URL.Query().Get("order")
+	if sortOrder == "" {
+		sortOrder = "desc"
+	}
+	if limit == "" {
+		limit = "100"
+	}
+	if offset == "" {
+		offset = "0"
+	}
+	
+	// Parse filter query if provided
+	var filterAST *FilterAST
+	var filterErr error
+	if filterQuery != "" {
+		filterAST, filterErr = ParseFilterQuery(filterQuery)
+		if filterErr != nil {
+			LogWarn("Failed to parse filter query in SQL queries endpoint", map[string]interface{}{
+				"filter": filterQuery,
+				"error":  filterErr.Error(),
+			})
+			http.Error(w, fmt.Sprintf("invalid filter query: %v", filterErr), 400)
+			return
 		}
-		
-		// Build tenant filter - skip tenant filtering if "all" is selected
-		var tenantFilter string
+	}
+	
+	// Build tenant filter - skip tenant filtering if "all" is selected
+	var tenantFilter string
+	if ctx.IsAllTenants() {
+		// No tenant filtering - show all data
+		tenantFilter = ""
+	} else {
+		// Handle NULL/empty tenant IDs by treating them as default tenant
+		tenantFilter = fmt.Sprintf("(coalesce(nullif(organization_id, ''), 'default-org') = '%s' AND coalesce(nullif(project_id, ''), 'default-project') = '%s')",
+			escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID))
+	}
+	
+	// Build base WHERE clause
+	baseWhere := "WHERE query_fingerprint IS NOT NULL AND query_fingerprint != ''"
+	
+	if tenantFilter != "" {
+		baseWhere += " AND " + tenantFilter
+	}
+	
+	// Add filter query if provided
+	if filterAST != nil {
+		var filterWhere string
 		if ctx.IsAllTenants() {
-			// No tenant filtering - show all data
-			tenantFilter = ""
+			filterWhere, filterErr = BuildClickHouseWhere(filterAST, "")
 		} else {
-			// Handle NULL/empty tenant IDs by treating them as default tenant
-			tenantFilter = fmt.Sprintf("(coalesce(nullif(organization_id, ''), 'default-org') = '%s' AND coalesce(nullif(project_id, ''), 'default-project') = '%s')",
-				escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID))
+			filterWhere, filterErr = BuildClickHouseWhere(filterAST, tenantFilter)
+		}
+		if filterErr != nil {
+			LogError(filterErr, "Failed to build filter WHERE clause in SQL queries", map[string]interface{}{
+				"filter": filterQuery,
+			})
+			http.Error(w, fmt.Sprintf("failed to build filter: %v", filterErr), 500)
+			return
 		}
 		
-		query := `SELECT 
-			query_fingerprint as fingerprint,
-			count(*) as execution_count,
-			avg(duration_ms) as avg_duration,
-			quantile(0.95)(duration_ms) as p95_duration,
-			quantile(0.99)(duration_ms) as p99_duration,
-			max(duration_ms) as max_duration
-			FROM opa.spans_min WHERE query_fingerprint IS NOT NULL AND query_fingerprint != ''`
-		
-		if tenantFilter != "" {
-			query += " AND " + tenantFilter
+		if strings.HasPrefix(filterWhere, " WHERE ") {
+			filterWhere = strings.TrimPrefix(filterWhere, " WHERE ")
 		}
-		if service != "" {
-			query += fmt.Sprintf(" AND service = '%s'", strings.ReplaceAll(service, "'", "''"))
-		}
-		if timeFrom != "" {
-			query += fmt.Sprintf(" AND start_ts >= '%s'", timeFrom)
-		} else {
-			query += " AND start_ts >= now() - INTERVAL 24 HOUR"
-		}
-		if timeTo != "" {
-			query += fmt.Sprintf(" AND start_ts <= '%s'", timeTo)
-		}
-		
-		query += " GROUP BY query_fingerprint"
+		baseWhere = baseWhere + " AND (" + filterWhere + ")"
+	}
+	
+	if service != "" {
+		baseWhere += fmt.Sprintf(" AND service = '%s'", strings.ReplaceAll(service, "'", "''"))
+	}
+	if timeFrom != "" {
+		baseWhere += fmt.Sprintf(" AND start_ts >= '%s'", timeFrom)
+	} else {
+		baseWhere += " AND start_ts >= now() - INTERVAL 24 HOUR"
+	}
+	if timeTo != "" {
+		baseWhere += fmt.Sprintf(" AND start_ts <= '%s'", timeTo)
+	}
+	
+	query := fmt.Sprintf(`SELECT 
+		query_fingerprint as fingerprint,
+		count(*) as execution_count,
+		avg(duration_ms) as avg_duration,
+		quantile(0.95)(duration_ms) as p95_duration,
+		quantile(0.99)(duration_ms) as p99_duration,
+		max(duration_ms) as max_duration,
+		max(start_ts) as last_created_at
+		FROM opa.spans_min %s`, baseWhere)
+	
+	query += " GROUP BY query_fingerprint"
 		
 		if minDuration != "" {
 			query += fmt.Sprintf(" HAVING avg(duration_ms) >= %s", minDuration)
 		}
 		
-		query += " ORDER BY execution_count DESC"
+		// Sorting
+		if sortBy == "last_created_at" || sortBy == "created_at" {
+			query += fmt.Sprintf(" ORDER BY last_created_at %s", strings.ToUpper(sortOrder))
+		} else if sortBy == "execution_count" || sortBy == "count" {
+			query += fmt.Sprintf(" ORDER BY execution_count %s", strings.ToUpper(sortOrder))
+		} else if sortBy == "avg_duration" || sortBy == "duration" {
+			query += fmt.Sprintf(" ORDER BY avg_duration %s", strings.ToUpper(sortOrder))
+		} else if sortBy == "max_duration" {
+			query += fmt.Sprintf(" ORDER BY max_duration %s", strings.ToUpper(sortOrder))
+		} else {
+			// Default to last_created_at DESC
+			query += " ORDER BY last_created_at DESC"
+		}
+		
 		limitInt, _ := strconv.Atoi(limit)
-		query += fmt.Sprintf(" LIMIT %d", limitInt)
+		offsetInt, _ := strconv.Atoi(offset)
+		query += fmt.Sprintf(" LIMIT %d OFFSET %d", limitInt, offsetInt)
 		
 		rows, err := queryClient.Query(query)
 		if err != nil {
@@ -4299,17 +5103,223 @@ func main() {
 		var queries []map[string]interface{}
 		for _, row := range rows {
 			queries = append(queries, map[string]interface{}{
-				"fingerprint":    getString(row, "fingerprint"),
-				"execution_count": getUint64(row, "execution_count"),
-				"avg_duration":   getFloat64(row, "avg_duration"),
-				"p95_duration":   getFloat64(row, "p95_duration"),
-				"p99_duration":   getFloat64(row, "p99_duration"),
-				"max_duration":   getFloat64(row, "max_duration"),
+				"fingerprint":     getString(row, "fingerprint"),
+				"execution_count":  getUint64(row, "execution_count"),
+				"avg_duration":    getFloat64(row, "avg_duration"),
+				"p95_duration":    getFloat64(row, "p95_duration"),
+				"p99_duration":    getFloat64(row, "p99_duration"),
+				"max_duration":    getFloat64(row, "max_duration"),
+				"last_created_at": getString(row, "last_created_at"),
 			})
+		}
+		
+		// Get total count for pagination
+		countQuery := fmt.Sprintf(`SELECT count(DISTINCT query_fingerprint) as total FROM opa.spans_min %s`, baseWhere)
+		if minDuration != "" {
+			countQuery = fmt.Sprintf(`SELECT count(*) as total FROM (
+				SELECT query_fingerprint, avg(duration_ms) as avg_duration
+				FROM opa.spans_min %s
+				GROUP BY query_fingerprint
+				HAVING avg(duration_ms) >= %s
+			)`, baseWhere, minDuration)
+		}
+		countRows, _ := queryClient.Query(countQuery)
+		total := int64(0)
+		if len(countRows) > 0 {
+			total = int64(getUint64(countRows[0], "total"))
 		}
 		
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"queries": queries,
+			"total":   total,
+		})
+	})
+	
+	// Redis operations endpoint
+	mux.HandleFunc("/api/redis/operations", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		
+		ctx, _ := ExtractTenantContext(r, queryClient)
+		service := r.URL.Query().Get("service")
+		timeFrom := r.URL.Query().Get("from")
+		timeTo := r.URL.Query().Get("to")
+		minDuration := r.URL.Query().Get("min_duration")
+		filterQuery := r.URL.Query().Get("filter")
+		limit := r.URL.Query().Get("limit")
+		offset := r.URL.Query().Get("offset")
+		sortBy := r.URL.Query().Get("sort")
+		if sortBy == "" {
+			sortBy = "last_created_at"
+		}
+		sortOrder := r.URL.Query().Get("order")
+		if sortOrder == "" {
+			sortOrder = "desc"
+		}
+		if limit == "" {
+			limit = "100"
+		}
+		if offset == "" {
+			offset = "0"
+		}
+		
+		// Parse filter query if provided
+		var filterAST *FilterAST
+		var filterErr error
+		if filterQuery != "" {
+			filterAST, filterErr = ParseFilterQuery(filterQuery)
+			if filterErr != nil {
+				LogWarn("Failed to parse filter query in Redis operations endpoint", map[string]interface{}{
+					"filter": filterQuery,
+					"error":  filterErr.Error(),
+				})
+				http.Error(w, fmt.Sprintf("invalid filter query: %v", filterErr), 400)
+				return
+			}
+		}
+		
+		// Build tenant filter
+		var tenantFilter string
+		if ctx.IsAllTenants() {
+			tenantFilter = ""
+		} else {
+			tenantFilter = fmt.Sprintf("(coalesce(nullif(organization_id, ''), 'default-org') = '%s' AND coalesce(nullif(project_id, ''), 'default-project') = '%s')",
+				escapeSQL(ctx.OrganizationID), escapeSQL(ctx.ProjectID))
+		}
+		
+		// Build base WHERE clause - query spans_full for Redis operations
+		baseWhere := "WHERE redis != '' AND redis != '[]' AND redis != 'null'"
+		
+		if tenantFilter != "" {
+			baseWhere += " AND " + tenantFilter
+		}
+		
+		// Add filter query if provided
+		if filterAST != nil {
+			var filterWhere string
+			if ctx.IsAllTenants() {
+				filterWhere, filterErr = BuildClickHouseWhere(filterAST, "")
+			} else {
+				filterWhere, filterErr = BuildClickHouseWhere(filterAST, tenantFilter)
+			}
+			if filterErr != nil {
+				LogError(filterErr, "Failed to build filter WHERE clause in Redis operations", map[string]interface{}{
+					"filter": filterQuery,
+				})
+				http.Error(w, fmt.Sprintf("failed to build filter: %v", filterErr), 500)
+				return
+			}
+			
+			if strings.HasPrefix(filterWhere, " WHERE ") {
+				filterWhere = strings.TrimPrefix(filterWhere, " WHERE ")
+			}
+			baseWhere = baseWhere + " AND (" + filterWhere + ")"
+		}
+		
+		if service != "" {
+			baseWhere += fmt.Sprintf(" AND service = '%s'", strings.ReplaceAll(service, "'", "''"))
+		}
+		if timeFrom != "" {
+			baseWhere += fmt.Sprintf(" AND start_ts >= '%s'", timeFrom)
+		} else {
+			baseWhere += " AND start_ts >= now() - INTERVAL 24 HOUR"
+		}
+		if timeTo != "" {
+			baseWhere += fmt.Sprintf(" AND start_ts <= '%s'", timeTo)
+		}
+		
+		// Query to extract Redis operations and aggregate by command+key
+		// Redis is stored as JSON string array, need to parse it using JSONExtractArrayRaw
+		query := fmt.Sprintf(`SELECT 
+			JSONExtractString(redis_op, 'command') as command,
+			coalesce(JSONExtractString(redis_op, 'key'), '') as key,
+			coalesce(JSONExtractFloat(redis_op, 'duration_ms'), 0) as duration_ms,
+			coalesce(JSONExtractBool(redis_op, 'hit'), 0) as hit,
+			start_ts,
+			service
+			FROM opa.spans_full
+			ARRAY JOIN JSONExtractArrayRaw(redis) as redis_op
+			%s`, baseWhere)
+		
+		// Group by command and key to get aggregated stats
+		groupQuery := fmt.Sprintf(`SELECT 
+			command,
+			key,
+			count(*) as execution_count,
+			avg(duration_ms) as avg_duration,
+			quantile(0.95)(duration_ms) as p95_duration,
+			quantile(0.99)(duration_ms) as p99_duration,
+			max(duration_ms) as max_duration,
+			sum(case when hit = 1 then 1 else 0 end) as hit_count,
+			sum(case when hit = 0 then 1 else 0 end) as miss_count,
+			max(start_ts) as last_created_at
+			FROM (%s) WHERE command != '' AND command != 'null' GROUP BY command, key`, query)
+		
+		if minDuration != "" {
+			groupQuery = fmt.Sprintf(`SELECT * FROM (%s) WHERE avg_duration >= %s`, groupQuery, minDuration)
+		}
+		
+		// Sorting
+		if sortBy == "last_created_at" || sortBy == "created_at" {
+			groupQuery += fmt.Sprintf(" ORDER BY last_created_at %s", strings.ToUpper(sortOrder))
+		} else if sortBy == "execution_count" || sortBy == "count" {
+			groupQuery += fmt.Sprintf(" ORDER BY execution_count %s", strings.ToUpper(sortOrder))
+		} else if sortBy == "avg_duration" || sortBy == "duration" {
+			groupQuery += fmt.Sprintf(" ORDER BY avg_duration %s", strings.ToUpper(sortOrder))
+		} else if sortBy == "max_duration" {
+			groupQuery += fmt.Sprintf(" ORDER BY max_duration %s", strings.ToUpper(sortOrder))
+		} else {
+			groupQuery += " ORDER BY last_created_at DESC"
+		}
+		
+		limitInt, _ := strconv.Atoi(limit)
+		offsetInt, _ := strconv.Atoi(offset)
+		groupQuery += fmt.Sprintf(" LIMIT %d OFFSET %d", limitInt, offsetInt)
+		
+		rows, err := queryClient.Query(groupQuery)
+		if err != nil {
+			LogError(err, "Redis operations query error", nil)
+			http.Error(w, fmt.Sprintf("query error: %v", err), 500)
+			return
+		}
+		
+		var operations []map[string]interface{}
+		for _, row := range rows {
+			operations = append(operations, map[string]interface{}{
+				"command":        getString(row, "command"),
+				"key":            getString(row, "key"),
+				"execution_count": getUint64(row, "execution_count"),
+				"avg_duration":    getFloat64(row, "avg_duration"),
+				"p95_duration":    getFloat64(row, "p95_duration"),
+				"p99_duration":    getFloat64(row, "p99_duration"),
+				"max_duration":    getFloat64(row, "max_duration"),
+				"hit_count":       getUint64(row, "hit_count"),
+				"miss_count":      getUint64(row, "miss_count"),
+				"last_created_at": getString(row, "last_created_at"),
+			})
+		}
+		
+		// Get total count for pagination
+		countQuery := fmt.Sprintf(`SELECT count(DISTINCT (command, key)) as total FROM (%s)`, query)
+		if minDuration != "" {
+			countQuery = fmt.Sprintf(`SELECT count(*) as total FROM (
+				SELECT command, key, avg(duration_ms) as avg_duration
+				FROM (%s)
+				GROUP BY command, key
+				HAVING avg(duration_ms) >= %s
+			)`, query, minDuration)
+		}
+		countRows, _ := queryClient.Query(countQuery)
+		total := int64(0)
+		if len(countRows) > 0 {
+			total = int64(getUint64(countRows[0], "total"))
+		}
+		
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"operations": operations,
+			"total":      total,
 		})
 	})
 	
@@ -4601,16 +5611,72 @@ func main() {
 		}
 		
 		service := r.URL.Query().Get("service")
+		filterQuery := r.URL.Query().Get("filter")
 		timeFrom := r.URL.Query().Get("from")
 		timeTo := r.URL.Query().Get("to")
 		limit := r.URL.Query().Get("limit")
+		offset := r.URL.Query().Get("offset")
+		sortBy := r.URL.Query().Get("sort")
+		if sortBy == "" {
+			sortBy = "last_seen" // Default to last_seen (effectively last_created_at for groups)
+		}
+		sortOrder := r.URL.Query().Get("order")
+		if sortOrder == "" {
+			sortOrder = "desc"
+		}
 		if limit == "" {
 			limit = "100"
+		}
+		if offset == "" {
+			offset = "0"
 		}
 		
 		// Query error_instances and join with spans_min to get service, then aggregate
 		// This gives us service information which is not in error_groups
-		query := `SELECT 
+		baseWhere := "WHERE 1=1"
+		
+		// Parse and apply filter query if provided
+		if filterQuery != "" {
+			filterAST, err := ParseFilterQuery(filterQuery)
+			if err != nil {
+				LogWarn("Failed to parse filter query in errors endpoint", map[string]interface{}{
+					"filter": filterQuery,
+					"error":  err.Error(),
+				})
+				http.Error(w, fmt.Sprintf("invalid filter query: %v", err), 400)
+				return
+			}
+			
+			if filterAST != nil {
+				// Build filter WHERE clause - note: filter fields need to map to ei.* or sm.* columns
+				// For errors, available fields: service (from sm), error_type, error_message, count, first_seen, last_seen
+				filterWhere, err := BuildClickHouseWhere(filterAST, "")
+				if err != nil {
+					LogError(err, "Failed to build filter WHERE clause for errors", map[string]interface{}{
+						"filter": filterQuery,
+					})
+					http.Error(w, fmt.Sprintf("failed to build filter: %v", err), 500)
+					return
+				}
+				
+				if strings.HasPrefix(filterWhere, " WHERE ") {
+					filterWhere = strings.TrimPrefix(filterWhere, " WHERE ")
+				}
+				// Map filter fields to actual columns: service -> sm.service, error_type -> ei.error_type, etc.
+				// Replace field names in filterWhere to match actual column names
+				filterWhere = strings.ReplaceAll(filterWhere, "service", "sm.service")
+				filterWhere = strings.ReplaceAll(filterWhere, "error_type", "ei.error_type")
+				filterWhere = strings.ReplaceAll(filterWhere, "error_message", "ei.error_message")
+				baseWhere = baseWhere + " AND (" + filterWhere + ")"
+			}
+		}
+		
+		// Apply service filter for backward compatibility (only if filter query not provided)
+		if filterQuery == "" && service != "" && service != "unknown" {
+			baseWhere += fmt.Sprintf(" AND sm.service = '%s'", strings.ReplaceAll(service, "'", "''"))
+		}
+		
+		query := fmt.Sprintf(`SELECT 
 			ei.error_type,
 			ei.error_message,
 			COALESCE(sm.service, 'unknown') as service,
@@ -4619,11 +5685,8 @@ func main() {
 			max(ei.occurred_at) as last_seen
 			FROM opa.error_instances ei
 			LEFT JOIN opa.spans_min sm ON ei.trace_id = sm.trace_id AND sm.trace_id != ''
-			WHERE 1=1`
+			%s`, baseWhere)
 		
-		if service != "" && service != "unknown" {
-			query += fmt.Sprintf(" AND sm.service = '%s'", strings.ReplaceAll(service, "'", "''"))
-		}
 		if timeFrom != "" {
 			// Convert ISO format to ClickHouse DateTime format
 			timeFromFormatted := strings.ReplaceAll(timeFrom, "T", " ")
@@ -4647,9 +5710,28 @@ func main() {
 		}
 		
 		query += " GROUP BY ei.error_type, ei.error_message, sm.service"
-		query += " ORDER BY count DESC, last_seen DESC"
+		
+		// Sorting
+		if sortBy == "last_seen" || sortBy == "created_at" || sortBy == "last_created_at" {
+			query += fmt.Sprintf(" ORDER BY last_seen %s", strings.ToUpper(sortOrder))
+		} else if sortBy == "first_seen" {
+			query += fmt.Sprintf(" ORDER BY first_seen %s", strings.ToUpper(sortOrder))
+		} else if sortBy == "count" {
+			query += fmt.Sprintf(" ORDER BY count %s", strings.ToUpper(sortOrder))
+		} else if sortBy == "error_message" || sortBy == "message" {
+			query += fmt.Sprintf(" ORDER BY error_message %s", strings.ToUpper(sortOrder))
+		} else if sortBy == "error_type" || sortBy == "type" {
+			query += fmt.Sprintf(" ORDER BY error_type %s", strings.ToUpper(sortOrder))
+		} else if sortBy == "service" {
+			query += fmt.Sprintf(" ORDER BY service %s", strings.ToUpper(sortOrder))
+		} else {
+			// Default to last_seen DESC
+			query += " ORDER BY last_seen DESC"
+		}
+		
 		limitInt, _ := strconv.Atoi(limit)
-		query += fmt.Sprintf(" LIMIT %d", limitInt)
+		offsetInt, _ := strconv.Atoi(offset)
+		query += fmt.Sprintf(" LIMIT %d OFFSET %d", limitInt, offsetInt)
 		
 		rows, err := queryClient.Query(query)
 		if err != nil {
@@ -4680,8 +5762,41 @@ func main() {
 			})
 		}
 		
+		// Get total count for pagination
+		countQuery := fmt.Sprintf(`SELECT count(*) as total FROM (
+			SELECT ei.error_type, ei.error_message, COALESCE(sm.service, 'unknown') as service
+			FROM opa.error_instances ei
+			LEFT JOIN opa.spans_min sm ON ei.trace_id = sm.trace_id AND sm.trace_id != ''
+			%s
+			GROUP BY ei.error_type, ei.error_message, sm.service
+		)`, baseWhere)
+		if timeFrom != "" {
+			timeFromFormatted := strings.ReplaceAll(timeFrom, "T", " ")
+			timeFromFormatted = strings.ReplaceAll(timeFromFormatted, "Z", "")
+			if len(timeFromFormatted) > 19 {
+				timeFromFormatted = timeFromFormatted[:19]
+			}
+			countQuery = strings.ReplaceAll(countQuery, baseWhere, baseWhere+fmt.Sprintf(" AND ei.occurred_at >= '%s'", timeFromFormatted))
+		} else {
+			countQuery = strings.ReplaceAll(countQuery, baseWhere, baseWhere+" AND ei.occurred_at >= now() - INTERVAL 7 DAY")
+		}
+		if timeTo != "" {
+			timeToFormatted := strings.ReplaceAll(timeTo, "T", " ")
+			timeToFormatted = strings.ReplaceAll(timeToFormatted, "Z", "")
+			if len(timeToFormatted) > 19 {
+				timeToFormatted = timeToFormatted[:19]
+			}
+			countQuery += fmt.Sprintf(" AND ei.occurred_at <= '%s'", timeToFormatted)
+		}
+		countRows, _ := queryClient.Query(countQuery)
+		total := int64(0)
+		if len(countRows) > 0 {
+			total = int64(getUint64(countRows[0], "total"))
+		}
+		
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"errors": errors,
+			"total":   total,
 		})
 	})
 	
@@ -4904,6 +6019,7 @@ func main() {
 		since := r.URL.Query().Get("since")
 		service := r.URL.Query().Get("service")
 		level := r.URL.Query().Get("level")
+		filterQuery := r.URL.Query().Get("filter")
 		all := r.URL.Query().Get("all") // If "all" is set, fetch all historical logs
 		cursor := r.URL.Query().Get("cursor") // Timestamp cursor for pagination
 
@@ -4922,10 +6038,62 @@ func main() {
 			useJoin = true
 		}
 
+		// Parse and apply filter query if provided
+		var filterWhere string
+		if filterQuery != "" {
+			filterAST, err := ParseFilterQuery(filterQuery)
+			if err != nil {
+				LogWarn("Failed to parse filter query in logs endpoint", map[string]interface{}{
+					"filter": filterQuery,
+					"error":  err.Error(),
+				})
+				http.Error(w, fmt.Sprintf("invalid filter query: %v", err), 400)
+				return
+			}
+			
+			if filterAST != nil {
+				// Build tenant filter for filter query builder
+				var tenantFilterForFilter string
+				if !ctx.IsAllTenants() {
+					tenantFilterForFilter = tenantFilter
+				}
+				
+				builtFilterWhere, err := BuildClickHouseWhere(filterAST, tenantFilterForFilter)
+				if err != nil {
+					LogError(err, "Failed to build filter WHERE clause for logs", map[string]interface{}{
+						"filter": filterQuery,
+					})
+					http.Error(w, fmt.Sprintf("failed to build filter: %v", err), 500)
+					return
+				}
+				
+				if strings.HasPrefix(builtFilterWhere, " WHERE ") {
+					builtFilterWhere = strings.TrimPrefix(builtFilterWhere, " WHERE ")
+				}
+				// Map filter fields to actual columns: service -> logs.service (or service), level -> logs.level (or level), etc.
+				if useJoin {
+					builtFilterWhere = strings.ReplaceAll(builtFilterWhere, "service", "logs.service")
+					builtFilterWhere = strings.ReplaceAll(builtFilterWhere, "level", "logs.level")
+					builtFilterWhere = strings.ReplaceAll(builtFilterWhere, "message", "logs.message")
+					builtFilterWhere = strings.ReplaceAll(builtFilterWhere, "trace_id", "logs.trace_id")
+					builtFilterWhere = strings.ReplaceAll(builtFilterWhere, "span_id", "logs.span_id")
+					builtFilterWhere = strings.ReplaceAll(builtFilterWhere, "timestamp", "logs.timestamp")
+				}
+				filterWhere = builtFilterWhere
+			}
+		}
+
 		// Query opa.logs table
 		var query string
+		baseWhere := "WHERE 1=1"
 		if useJoin {
-			query = `SELECT 
+			if tenantFilter != "" {
+				baseWhere += " AND " + tenantFilter
+			}
+			if filterWhere != "" {
+				baseWhere += " AND (" + filterWhere + ")"
+			}
+			query = fmt.Sprintf(`SELECT 
 				logs.id,
 				logs.trace_id,
 				logs.span_id,
@@ -4937,9 +6105,12 @@ func main() {
 				logs.fields
 			FROM opa.logs as logs
 			INNER JOIN opa.spans_min as spans_min ON logs.trace_id = spans_min.trace_id
-			WHERE 1=1 AND ` + tenantFilter
+			%s`, baseWhere)
 		} else {
-			query = `SELECT 
+			if filterWhere != "" {
+				baseWhere += " AND (" + filterWhere + ")"
+			}
+			query = fmt.Sprintf(`SELECT 
 				id,
 				trace_id,
 				span_id,
@@ -4950,7 +6121,7 @@ func main() {
 				timestamp,
 				fields
 			FROM opa.logs 
-			WHERE 1=1`
+			%s`, baseWhere)
 		}
 		
 		// Use table prefix when joining
@@ -4961,12 +6132,15 @@ func main() {
 			levelColumn = "logs.level"
 		}
 		
-		if service != "" {
-			query += fmt.Sprintf(" AND %s = '%s'", serviceColumn, strings.ReplaceAll(service, "'", "''"))
-		}
-		
-		if level != "" {
-			query += fmt.Sprintf(" AND %s = '%s'", levelColumn, strings.ReplaceAll(level, "'", "''"))
+		// Apply service/level filters for backward compatibility (only if filter query not provided)
+		if filterQuery == "" {
+			if service != "" {
+				query += fmt.Sprintf(" AND %s = '%s'", serviceColumn, strings.ReplaceAll(service, "'", "''"))
+			}
+			
+			if level != "" {
+				query += fmt.Sprintf(" AND %s = '%s'", levelColumn, strings.ReplaceAll(level, "'", "''"))
+			}
 		}
 		
 		// Cursor-based pagination: if cursor is provided, fetch logs older than cursor
@@ -5492,11 +6666,14 @@ func main() {
 		}
 		
 		// Get related traces
-		traceQuery := fmt.Sprintf(`SELECT DISTINCT trace_id, min(start_ts) as start_ts, 
-			sum(duration_ms) as duration_ms
-			FROM opa.spans_min WHERE (status = 'error' OR status = '0')
-			AND service = '%s' AND name = '%s'
-			GROUP BY trace_id ORDER BY start_ts DESC LIMIT 10`, serviceName, errorName)
+		traceQuery := fmt.Sprintf(`SELECT trace_id, start_ts, 
+			toUnixTimestamp64Milli(end_ts) - toUnixTimestamp64Milli(start_ts) as duration_ms
+			FROM (
+				SELECT DISTINCT trace_id, min(start_ts) as start_ts, max(end_ts) as end_ts
+				FROM opa.spans_min WHERE (status = 'error' OR status = '0')
+				AND service = '%s' AND name = '%s'
+				GROUP BY trace_id
+			) ORDER BY start_ts DESC LIMIT 10`, serviceName, errorName)
 		
 		traceRows, _ := queryClient.Query(traceQuery)
 		var relatedTraces []map[string]interface{}
@@ -5655,7 +6832,7 @@ func main() {
 		
 		// Build query similar to handleListTraces but without pagination
 		query := "SELECT trace_id, service, min(start_ts) as start_ts, max(end_ts) as end_ts, "
-		query += "sum(duration_ms) as duration_ms, count(*) as span_count, "
+		query += "dateDiff('millisecond', min(start_ts), max(end_ts)) as duration_ms, count(*) as span_count, "
 		query += "any(status) as status FROM ("
 		query += "SELECT trace_id, service, start_ts, end_ts, duration_ms, status "
 		query += "FROM opa.spans_min WHERE 1=1"
@@ -5883,16 +7060,55 @@ func main() {
 		
 		service := r.URL.Query().Get("service")
 		severity := r.URL.Query().Get("severity")
+		filterQuery := r.URL.Query().Get("filter")
 		timeFrom := r.URL.Query().Get("from")
 		
-		query := "SELECT id, type, service, metric, value, expected, score, severity, detected_at, metadata FROM opa.anomalies WHERE 1=1"
+		baseWhere := "WHERE 1=1"
 		
-		if service != "" {
-			query += fmt.Sprintf(" AND service = '%s'", escapeSQL(service))
+		// Parse and apply filter query if provided
+		if filterQuery != "" {
+			filterAST, err := ParseFilterQuery(filterQuery)
+			if err != nil {
+				LogWarn("Failed to parse filter query in anomalies endpoint", map[string]interface{}{
+					"filter": filterQuery,
+					"error":  err.Error(),
+				})
+				http.Error(w, fmt.Sprintf("invalid filter query: %v", err), 400)
+				return
+			}
+			
+			if filterAST != nil {
+				// Build filter WHERE clause
+				filterWhere, err := BuildClickHouseWhere(filterAST, "")
+				if err != nil {
+					LogError(err, "Failed to build filter WHERE clause for anomalies", map[string]interface{}{
+						"filter": filterQuery,
+					})
+					http.Error(w, fmt.Sprintf("failed to build filter: %v", err), 500)
+					return
+				}
+				
+				if strings.HasPrefix(filterWhere, " WHERE ") {
+					filterWhere = strings.TrimPrefix(filterWhere, " WHERE ")
+				}
+				// Map filter fields to actual columns: service, severity, type, metric, value, detected_at
+				// Fields already match column names, so no mapping needed
+				baseWhere = baseWhere + " AND (" + filterWhere + ")"
+			}
 		}
-		if severity != "" {
-			query += fmt.Sprintf(" AND severity = '%s'", escapeSQL(severity))
+		
+		query := fmt.Sprintf("SELECT id, type, service, metric, value, expected, score, severity, detected_at, metadata FROM opa.anomalies %s", baseWhere)
+		
+		// Apply service/severity filters for backward compatibility (only if filter query not provided)
+		if filterQuery == "" {
+			if service != "" {
+				query += fmt.Sprintf(" AND service = '%s'", escapeSQL(service))
+			}
+			if severity != "" {
+				query += fmt.Sprintf(" AND severity = '%s'", escapeSQL(severity))
+			}
 		}
+		
 		if timeFrom != "" {
 			query += fmt.Sprintf(" AND detected_at >= '%s'", timeFrom)
 		} else {
@@ -7109,6 +8325,13 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 		}
 		
 		// Store minimal row
+		// Set creation timestamp once per span (used for both min and full)
+		createdAt := time.Now()
+		
+		// Normalize timestamps - convert from seconds to milliseconds if needed
+		normalizedStartTS := normalizeTimestamp(inc.StartTS)
+		normalizedEndTS := normalizeTimestamp(inc.EndTS)
+		
 		min := map[string]interface{}{
 			"organization_id": orgID,
 			"project_id":      projectID,
@@ -7120,14 +8343,15 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 			"url_scheme":      inc.URLScheme,
 			"url_host":        inc.URLHost,
 			"url_path":        inc.URLPath,
-			"start_ts":        time.UnixMilli(inc.StartTS).Format("2006-01-02 15:04:05.000"),
-			"end_ts":          time.UnixMilli(inc.EndTS).Format("2006-01-02 15:04:05.000"),
+			"start_ts":        time.UnixMilli(normalizedStartTS).Format("2006-01-02 15:04:05.000"),
+			"end_ts":          time.UnixMilli(normalizedEndTS).Format("2006-01-02 15:04:05.000"),
 			"duration_ms":     inc.Duration,
 			"cpu_ms":          inc.CPUms,
 			"status":          inc.Status,
 			"language":        language,
 			"bytes_sent":      bytesSent,
 			"bytes_received":  bytesReceived,
+			"created_at":      createdAt.Format("2006-01-02 15:04:05.000"),
 		}
 		
 		// Add optional language metadata fields
@@ -7612,8 +8836,8 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 				"url_scheme":       inc.URLScheme,
 				"url_host":        inc.URLHost,
 				"url_path":        inc.URLPath,
-				"start_ts":   time.UnixMilli(inc.StartTS).Format("2006-01-02 15:04:05.000"),
-				"end_ts":     time.UnixMilli(inc.EndTS).Format("2006-01-02 15:04:05.000"),
+				"start_ts":   time.UnixMilli(normalizedStartTS).Format("2006-01-02 15:04:05.000"),
+				"end_ts":     time.UnixMilli(normalizedEndTS).Format("2006-01-02 15:04:05.000"),
 				"duration_ms": inc.Duration,
 				"cpu_ms":     inc.CPUms,
 				"status":     inc.Status,
@@ -7626,6 +8850,7 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 				"tags":       tagsStr,
 				"dumps":      dumpsJSON,
 				"language":   language,
+				"created_at": createdAt.Format("2006-01-02 15:04:05.000"),
 			}
 			
 			// Add optional language metadata fields
