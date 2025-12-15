@@ -290,13 +290,15 @@ func parseDateTime(row map[string]interface{}, key string) int64 {
 // normalizeTimestamp converts a timestamp to milliseconds if it appears to be in seconds
 // Year 2000 in milliseconds = 946684800000
 // If timestamp is less than this threshold, it's likely in seconds and needs conversion
+// NOTE: PHP extension always sends timestamps in milliseconds, so we should only convert
+// timestamps that are clearly in seconds (i.e., less than year 2000 in milliseconds)
 func normalizeTimestamp(ts int64) int64 {
 	// Threshold: year 2000 in milliseconds
 	const year2000Ms = 946684800000
 	
-	// If timestamp is less than year 2000 in milliseconds, it might be in seconds
-	// But we need to be careful - very small values might be legitimate
-	// Check if interpreting as milliseconds gives a date before year 2000
+	// Only convert if timestamp is less than year 2000 in milliseconds
+	// This handles legacy timestamps that might be in seconds
+	// PHP extension always sends milliseconds, so timestamps >= year2000Ms are already correct
 	if ts > 0 && ts < year2000Ms {
 		// Check if it's a reasonable Unix timestamp in seconds (between 1970 and 2100)
 		// Year 1970 = 0 seconds, Year 2100 = 4102444800 seconds
@@ -311,18 +313,10 @@ func normalizeTimestamp(ts int64) int64 {
 		}
 	}
 	
-	// Also check for timestamps that are clearly in seconds (year 2081 range)
-	// Year 2081 in seconds ≈ 3500000000, in milliseconds ≈ 3500000000000
-	// If timestamp is between 3000000000 and 5000000000, it's likely seconds
-	if ts >= 3000000000 && ts <= 5000000000 {
-		converted := ts * 1000
-		// Verify converted value is reasonable (should be a future date but not too far)
-		// Year 2100 in milliseconds = 4102444800000
-		if converted <= 4102444800000 {
-			log.Printf("[WARN] Timestamp appears to be in seconds (year 2081 range), converting: %d -> %d", ts, converted)
-			return converted
-		}
-	}
+	// REMOVED: The check for 3000000000-5000000000 range was incorrect
+	// Timestamps from PHP extension are always in milliseconds, so a timestamp in that range
+	// would be a valid millisecond timestamp (around 1970-1971), not seconds.
+	// Converting it would incorrectly produce dates in 2081.
 	
 	return ts
 }
@@ -2677,6 +2671,14 @@ func main() {
 					continue
 				}
 				
+				// Skip invalid service names
+				fromServiceLower := strings.ToLower(fromService)
+				toServiceLower := strings.ToLower(toService)
+				if fromServiceLower == "unknown" || fromServiceLower == "null" || fromServiceLower == "undefined" || fromServiceLower == "none" ||
+					toServiceLower == "unknown" || toServiceLower == "null" || toServiceLower == "undefined" || toServiceLower == "none" {
+					continue
+				}
+				
 				services[fromService] = true
 				services[toService] = true
 
@@ -2826,10 +2828,24 @@ func main() {
 					continue
 				}
 				
+				// Skip invalid database system names
+				dbSystemLower := strings.ToLower(dbSystem)
+				if dbSystemLower == "unknown" || dbSystemLower == "null" || dbSystemLower == "undefined" || dbSystemLower == "none" {
+					continue
+				}
+				
 				// Extract host if available
 				dbHost := ""
 				if host, ok := sqlItem["db_host"].(string); ok && host != "" {
 					dbHost = host
+				}
+				
+				// Skip invalid database host names
+				if dbHost != "" {
+					dbHostLower := strings.ToLower(dbHost)
+					if dbHostLower == "unknown" || dbHostLower == "null" || dbHostLower == "undefined" || dbHostLower == "none" {
+						dbHost = "" // Use dbSystem only if host is invalid
+					}
 				}
 				
 				// Build target identifier
@@ -2975,6 +2991,12 @@ func main() {
 					continue
 				}
 				
+				// Skip invalid URLs like "unknown" or other placeholder values
+				urlLower := strings.ToLower(url)
+				if urlLower == "unknown" || urlLower == "null" || urlLower == "undefined" || urlLower == "none" {
+					continue
+				}
+				
 				// Skip internal calls to the same service (but allow calls to other services)
 				// Only skip if the URL host exactly matches the service name
 				if url == fromService || strings.HasPrefix(url, fromService+":") || strings.HasPrefix(url, fromService+"/") {
@@ -2988,6 +3010,12 @@ func main() {
 					if len(parts) > 0 {
 						baseURL = strings.Split(url, "/")[0] + "//" + parts[0]
 					}
+				}
+				
+				// Also check baseURL for invalid values after extraction
+				baseURLLower := strings.ToLower(baseURL)
+				if baseURLLower == "unknown" || baseURLLower == "null" || baseURLLower == "undefined" || baseURLLower == "none" {
+					continue
 				}
 				
 				// Use separate maps for curl vs regular HTTP
@@ -3126,6 +3154,156 @@ func main() {
 			})
 		}
 		
+		// Redis dependencies from spans_full
+		// timeFrom and timeTo are already converted to DateTime or ClickHouse functions above
+		var redisQuery string
+		if tenantFilter != "" {
+			redisQuery = fmt.Sprintf(`SELECT 
+				service,
+				redis
+				FROM opa.spans_full
+				WHERE %s
+					AND redis != '' AND redis != '[]' AND redis != 'null'
+					AND start_ts >= %s AND start_ts <= %s
+				LIMIT 10000`,
+				tenantFilter, timeFrom, timeTo)
+		} else {
+			redisQuery = fmt.Sprintf(`SELECT 
+				service,
+				redis
+				FROM opa.spans_full
+				WHERE redis != '' AND redis != '[]' AND redis != 'null'
+					AND start_ts >= %s AND start_ts <= %s
+				LIMIT 10000`,
+				timeFrom, timeTo)
+		}
+		
+		redisRows, redisErr := queryClient.Query(redisQuery)
+		if redisErr != nil {
+			LogError(redisErr, "Failed to query Redis dependencies", map[string]interface{}{
+				"query": redisQuery,
+			})
+		}
+		redisDepsMap := make(map[string]map[string]interface{}) // key: "service->host"
+		
+		for _, row := range redisRows {
+			fromService := getString(row, "service")
+			redisData := getString(row, "redis")
+			if fromService == "" || redisData == "" {
+				continue
+			}
+			
+			var redisArray []map[string]interface{}
+			if err := json.Unmarshal([]byte(redisData), &redisArray); err != nil {
+				continue
+			}
+			
+			for _, redisOp := range redisArray {
+				// Extract host
+				redisHost := ""
+				if host, ok := redisOp["host"].(string); ok && host != "" {
+					redisHost = host
+				} else if host, ok := redisOp["Host"].(string); ok && host != "" {
+					redisHost = host
+				}
+				
+				// Skip invalid redis host names
+				if redisHost != "" {
+					redisHostLower := strings.ToLower(redisHost)
+					if redisHostLower == "unknown" || redisHostLower == "null" || redisHostLower == "undefined" || redisHostLower == "none" {
+						redisHost = "" // Will fallback to generic redis
+					}
+				}
+				
+				// Extract port
+				redisPort := ""
+				if port, ok := redisOp["port"].(string); ok && port != "" {
+					redisPort = port
+				} else if port, ok := redisOp["Port"].(string); ok && port != "" {
+					redisPort = port
+				} else if port, ok := redisOp["port"].(float64); ok && port > 0 {
+					redisPort = fmt.Sprintf("%.0f", port)
+				} else if port, ok := redisOp["Port"].(float64); ok && port > 0 {
+					redisPort = fmt.Sprintf("%.0f", port)
+				}
+				
+				// Format host:port based on available information
+				target := ""
+				if redisHost != "" && redisPort != "" {
+					target = fmt.Sprintf("redis://%s:%s", redisHost, redisPort)
+				} else if redisHost != "" {
+					target = fmt.Sprintf("redis://%s", redisHost)
+				} else {
+					// Fallback to generic redis if no host info
+					target = "redis"
+				}
+				
+				key := fmt.Sprintf("%s->%s", fromService, target)
+				dep, exists := redisDepsMap[key]
+				if !exists {
+					dep = map[string]interface{}{
+						"from_service": fromService,
+						"target":       target,
+						"call_count":   int64(0),
+						"total_duration": 0.0,
+						"error_count":  int64(0),
+					}
+					redisDepsMap[key] = dep
+				}
+				
+				dep["call_count"] = dep["call_count"].(int64) + 1
+				if duration, ok := redisOp["duration_ms"].(float64); ok {
+					dep["total_duration"] = dep["total_duration"].(float64) + duration
+				} else if duration, ok := redisOp["duration"].(float64); ok {
+					dep["total_duration"] = dep["total_duration"].(float64) + duration*1000
+				}
+				if status, ok := redisOp["status"].(string); ok && (status == "error" || status == "0") {
+					dep["error_count"] = dep["error_count"].(int64) + 1
+				}
+			}
+		}
+		
+		// Convert Redis dependencies to edges
+		for _, dep := range redisDepsMap {
+			fromService := dep["from_service"].(string)
+			target := dep["target"].(string)
+			callCount := dep["call_count"].(int64)
+			if callCount == 0 {
+				continue
+			}
+			
+			services[fromService] = true
+			externalDeps[target] = true
+			
+			avgLatency := dep["total_duration"].(float64) / float64(callCount)
+			errorRate := float64(dep["error_count"].(int64)) / float64(callCount) * 100.0
+			healthStatus := calculateHealthStatus(errorRate, avgLatency)
+			
+			successRate := 100.0 - errorRate
+			if successRate < 0 {
+				successRate = 0
+			}
+
+			edges = append(edges, map[string]interface{}{
+				"from":            fromService,
+				"to":              target,
+				"avg_latency_ms":  avgLatency,
+				"min_latency_ms":  avgLatency,
+				"max_latency_ms":  avgLatency,
+				"p95_latency_ms":  avgLatency,
+				"p99_latency_ms":  avgLatency,
+				"error_rate":      errorRate,
+				"success_rate":   successRate,
+				"call_count":      callCount,
+				"throughput":      0.0,
+				"bytes_sent":      0,
+				"bytes_received":  0,
+				"health_status":   healthStatus,
+				"dependency_type": "redis",
+				"dependency_target": target,
+			})
+		}
+		
 		// Always ensure services with external dependencies are included
 		// Also add all services that have spans in the time range
 		var allServicesQuery string
@@ -3145,15 +3323,22 @@ func main() {
 		serviceRows, _ = queryClient.Query(allServicesQuery)
 		for _, row := range serviceRows {
 			service := getString(row, "service")
+			// Filter out empty and invalid service names
 			if service != "" {
-				services[service] = true
+				serviceLower := strings.ToLower(service)
+				if serviceLower != "unknown" && serviceLower != "null" && serviceLower != "undefined" && serviceLower != "none" {
+					services[service] = true
+				}
 			}
 		}
 		
 		// Also add services that have external dependencies (from edges we just created)
 		for _, edge := range edges {
 			if from, ok := edge["from"].(string); ok && from != "" {
-				services[from] = true
+				fromLower := strings.ToLower(from)
+				if fromLower != "unknown" && fromLower != "null" && fromLower != "undefined" && fromLower != "none" {
+					services[from] = true
+				}
 			}
 		}
 
@@ -5235,6 +5420,8 @@ mux.HandleFunc("/api/services/metadata", func(w http.ResponseWriter, r *http.Req
 		query := fmt.Sprintf(`SELECT 
 			JSONExtractString(redis_op, 'command') as command,
 			coalesce(JSONExtractString(redis_op, 'key'), '') as key,
+			coalesce(JSONExtractString(redis_op, 'host'), '') as host,
+			coalesce(JSONExtractString(redis_op, 'port'), '') as port,
 			coalesce(JSONExtractFloat(redis_op, 'duration_ms'), 0) as duration_ms,
 			coalesce(JSONExtractBool(redis_op, 'hit'), 0) as hit,
 			start_ts,
@@ -5243,10 +5430,12 @@ mux.HandleFunc("/api/services/metadata", func(w http.ResponseWriter, r *http.Req
 			ARRAY JOIN JSONExtractArrayRaw(redis) as redis_op
 			%s`, baseWhere)
 		
-		// Group by command and key to get aggregated stats
+		// Group by command, key, host, and port to get aggregated stats
 		groupQuery := fmt.Sprintf(`SELECT 
 			command,
 			key,
+			host,
+			port,
 			count(*) as execution_count,
 			avg(duration_ms) as avg_duration,
 			quantile(0.95)(duration_ms) as p95_duration,
@@ -5255,7 +5444,7 @@ mux.HandleFunc("/api/services/metadata", func(w http.ResponseWriter, r *http.Req
 			sum(case when hit = 1 then 1 else 0 end) as hit_count,
 			sum(case when hit = 0 then 1 else 0 end) as miss_count,
 			max(start_ts) as last_created_at
-			FROM (%s) WHERE command != '' AND command != 'null' GROUP BY command, key`, query)
+			FROM (%s) WHERE command != '' AND command != 'null' GROUP BY command, key, host, port`, query)
 		
 		if minDuration != "" {
 			groupQuery = fmt.Sprintf(`SELECT * FROM (%s) WHERE avg_duration >= %s`, groupQuery, minDuration)
@@ -5290,6 +5479,8 @@ mux.HandleFunc("/api/services/metadata", func(w http.ResponseWriter, r *http.Req
 			operations = append(operations, map[string]interface{}{
 				"command":        getString(row, "command"),
 				"key":            getString(row, "key"),
+				"host":           getString(row, "host"),
+				"port":           getString(row, "port"),
 				"execution_count": getUint64(row, "execution_count"),
 				"avg_duration":    getFloat64(row, "avg_duration"),
 				"p95_duration":    getFloat64(row, "p95_duration"),
@@ -5302,12 +5493,12 @@ mux.HandleFunc("/api/services/metadata", func(w http.ResponseWriter, r *http.Req
 		}
 		
 		// Get total count for pagination
-		countQuery := fmt.Sprintf(`SELECT count(DISTINCT (command, key)) as total FROM (%s)`, query)
+		countQuery := fmt.Sprintf(`SELECT count(DISTINCT (command, key, host, port)) as total FROM (%s)`, query)
 		if minDuration != "" {
 			countQuery = fmt.Sprintf(`SELECT count(*) as total FROM (
-				SELECT command, key, avg(duration_ms) as avg_duration
+				SELECT command, key, host, port, avg(duration_ms) as avg_duration
 				FROM (%s)
-				GROUP BY command, key
+				GROUP BY command, key, host, port
 				HAVING avg(duration_ms) >= %s
 			)`, query, minDuration)
 		}
