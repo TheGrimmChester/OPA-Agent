@@ -34,6 +34,8 @@ type Incoming struct {
 	LanguageVersion *string         `json:"language_version,omitempty"`
 	Framework       *string         `json:"framework,omitempty"`
 	FrameworkVersion *string        `json:"framework_version,omitempty"`
+	W3CTraceParent  *string         `json:"w3c_traceparent,omitempty"`
+	W3CTraceState   *string         `json:"w3c_tracestate,omitempty"`
 }
 
 // CallNode represents a function call in the stack trace
@@ -84,6 +86,8 @@ type Span struct {
 	LanguageVersion *string                `json:"language_version,omitempty"`
 	Framework       *string                `json:"framework,omitempty"`
 	FrameworkVersion *string               `json:"framework_version,omitempty"`
+	W3CTraceParent   *string                `json:"w3c_traceparent,omitempty"`
+	W3CTraceState    *string                `json:"w3c_tracestate,omitempty"`
 }
 
 // Trace represents a complete trace with all spans

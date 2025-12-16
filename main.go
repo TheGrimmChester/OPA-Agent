@@ -294,7 +294,36 @@ func parseDateTime(row map[string]interface{}, key string) int64 {
 // timestamps that are clearly in seconds (i.e., less than year 2000 in milliseconds)
 func normalizeTimestamp(ts int64) int64 {
 	// Threshold: year 2000 in milliseconds
-	const year2000Ms = 946684800000
+	const year2000Ms int64 = 946684800000
+	now := time.Now().UnixMilli()
+	// Maximum reasonable future timestamp: 1 day from now (allows for clock skew between servers)
+	maxReasonableMs := now + (24 * 60 * 60 * 1000)
+	
+	// Validate timestamp is not before Unix epoch (1970-01-01)
+	if ts < 0 {
+		log.Printf("[WARN] Invalid negative timestamp: %d, using current time", ts)
+		return now
+	}
+	
+	// Validate timestamp is not unreasonably far in the future (indicates a bug)
+	// This check happens before conversion to catch issues early
+	if ts > maxReasonableMs {
+		// This timestamp represents a date more than 1 day in the future, which is invalid
+		// Check if it might be in seconds (very large future date)
+		// If ts is in seconds and represents a future date, converting to ms would make it even worse
+		// So we should check if dividing by 1000 makes it reasonable
+		if ts/1000 > maxReasonableMs {
+			// Even in seconds it's too far in the future, definitely invalid
+			futureDate := time.UnixMilli(ts).Format("2006-01-02 15:04:05.000")
+			log.Printf("[WARN] Invalid future timestamp detected: %d (date: %s), clamping to current time", ts, futureDate)
+			return now
+		}
+		// If dividing by 1000 makes it reasonable, it might be in milliseconds but just slightly ahead
+		// This is likely a clock skew issue, clamp to max reasonable
+		futureDate := time.UnixMilli(ts).Format("2006-01-02 15:04:05.000")
+		log.Printf("[WARN] Future timestamp detected (likely clock skew): %d (date: %s), clamping to max reasonable", ts, futureDate)
+		return maxReasonableMs
+	}
 	
 	// Only convert if timestamp is less than year 2000 in milliseconds
 	// This handles legacy timestamps that might be in seconds
@@ -306,10 +335,17 @@ func normalizeTimestamp(ts int64) int64 {
 			// This looks like seconds, convert to milliseconds
 			converted := ts * 1000
 			// Verify the converted value makes sense (should be >= year 2000 in ms)
-			if converted >= year2000Ms {
-				log.Printf("[WARN] Timestamp appears to be in seconds, converting: %d -> %d", ts, converted)
+			if converted >= year2000Ms && converted <= maxReasonableMs {
+				log.Printf("[WARN] Timestamp appears to be in seconds, converting: %d -> %d (date: %s)", 
+					ts, converted, time.UnixMilli(converted).Format("2006-01-02 15:04:05.000"))
 				return converted
 			}
+		}
+		// If conversion doesn't produce a reasonable value, log and use current time
+		if ts < 946684800000/1000 { // Older than year 2000 even in seconds
+			pastDate := time.Unix(ts, 0).Format("2006-01-02 15:04:05.000")
+			log.Printf("[WARN] Suspiciously old timestamp that cannot be converted: %d (date if seconds: %s), using current time", ts, pastDate)
+			return now
 		}
 	}
 	
@@ -1572,7 +1608,7 @@ func main() {
 	var baseQuery string
 	if needsFullJoin {
 		// Join spans_min with spans_full to access tags for HTTP filtering and filter query
-		baseQuery = "SELECT DISTINCT sm.trace_id, sm.service, sm.start_ts, sm.end_ts, sm.duration_ms, sm.status, sm.language, sm.language_version, sm.framework, sm.framework_version "
+		baseQuery = "SELECT DISTINCT sm.trace_id, sm.service, sm.start_ts, sm.end_ts, sm.duration_ms, sm.status, sm.language, sm.language_version, sm.framework, sm.framework_version, sm.created_at "
 		baseQuery += "FROM opa.spans_min sm "
 		baseQuery += "INNER JOIN opa.spans_full sf ON sm.trace_id = sf.trace_id AND sm.span_id = sf.span_id "
 		
@@ -1627,7 +1663,7 @@ func main() {
 		}
 	} else {
 		// No HTTP filters or filter query, use simpler query on spans_min only
-		baseQuery = "SELECT trace_id, service, start_ts, end_ts, duration_ms, status, language, language_version, framework, framework_version "
+		baseQuery = "SELECT trace_id, service, start_ts, end_ts, duration_ms, status, language, language_version, framework, framework_version, created_at "
 		
 		// Build tenant filter
 		var tenantFilter string
@@ -1712,25 +1748,27 @@ func main() {
 		// Build final aggregation query
 		// span_count is simply COUNT(*) since all spans are pre-constructed and stored
 		// No need for complex JOIN or stack calculation - each span is stored as a separate row
+		// Cap calculated duration at 1 hour (3600000 ms) to prevent incorrect values from bad timestamps
+		// This prevents durations like 1765882762.16s (55 years) from appearing due to timestamp issues
 		var query string
 		if needsFullJoin {
 			// baseQuery uses sm. prefix for HTTP filters
 			query = "SELECT sm.trace_id, sm.service, min(sm.start_ts) as start_ts, max(sm.end_ts) as end_ts, "
-			query += "toUnixTimestamp64Milli(max(sm.end_ts)) - toUnixTimestamp64Milli(min(sm.start_ts)) as duration_ms, count(*) as span_count, "
+			query += "least(toUnixTimestamp64Milli(max(sm.end_ts)) - toUnixTimestamp64Milli(min(sm.start_ts)), 3600000) as duration_ms, count(*) as span_count, "
 			query += "any(sm.status) as status, any(sm.language) as language, any(sm.language_version) as language_version, "
-			query += "any(sm.framework) as framework, any(sm.framework_version) as framework_version "
+			query += "any(sm.framework) as framework, any(sm.framework_version) as framework_version, max(sm.created_at) as created_at "
 			query += "FROM (" + baseQuery + ") sm "
 			query += "GROUP BY sm.trace_id, sm.service"
 		} else {
 			// baseQuery doesn't use prefix - use subquery to avoid nested aggregates
 			query = "SELECT trace_id, service, start_ts, end_ts, "
-			query += "toUnixTimestamp64Milli(end_ts) - toUnixTimestamp64Milli(start_ts) as duration_ms, span_count, "
-			query += "status, language, language_version, framework, framework_version "
+			query += "least(toUnixTimestamp64Milli(end_ts) - toUnixTimestamp64Milli(start_ts), 3600000) as duration_ms, span_count, "
+			query += "status, language, language_version, framework, framework_version, created_at "
 			query += "FROM ("
 			query += "SELECT trace_id, service, min(start_ts) as start_ts, max(end_ts) as end_ts, "
 			query += "count(*) as span_count, "
 			query += "any(status) as status, any(language) as language, any(language_version) as language_version, "
-			query += "any(framework) as framework, any(framework_version) as framework_version "
+			query += "any(framework) as framework, any(framework_version) as framework_version, max(created_at) as created_at "
 			query += "FROM (" + baseQuery + ") "
 			query += "GROUP BY trace_id, service"
 			query += ")"
@@ -1778,7 +1816,7 @@ func main() {
 				"trace_id":   getString(row, "trace_id"),
 				"service":    getString(row, "service"),
 				"start_ts":    getString(row, "start_ts"),
-				"created_at":  getString(row, "start_ts"), // Map start_ts to created_at for consistency
+				"created_at":  getString(row, "created_at"), // Use actual created_at from database
 				"end_ts":      getString(row, "end_ts"),
 				"duration_ms": getFloat64(row, "duration_ms"),
 				"span_count":  getUint64(row, "span_count"),
@@ -2061,6 +2099,8 @@ func main() {
 						Duration: inc.Duration,
 						CPUms:    inc.CPUms,
 						Status:   inc.Status,
+						W3CTraceParent: inc.W3CTraceParent,
+						W3CTraceState:  inc.W3CTraceState,
 					}
 					if len(inc.Net) > 0 {
 						json.Unmarshal(inc.Net, &span.Net)
@@ -2175,12 +2215,16 @@ func main() {
 				Duration: inc.Duration,
 				CPUms:    inc.CPUms,
 				Status:   inc.Status,
+				W3CTraceParent: inc.W3CTraceParent,
+				W3CTraceState:  inc.W3CTraceState,
 			}
-			span.Language = inc.Language
-			span.LanguageVersion = inc.LanguageVersion
-			span.Framework = inc.Framework
-			span.FrameworkVersion = inc.FrameworkVersion
-			if len(inc.Net) > 0 {
+					span.Language = inc.Language
+					span.LanguageVersion = inc.LanguageVersion
+					span.Framework = inc.Framework
+					span.FrameworkVersion = inc.FrameworkVersion
+					span.W3CTraceParent = inc.W3CTraceParent
+					span.W3CTraceState = inc.W3CTraceState
+					if len(inc.Net) > 0 {
 				json.Unmarshal(inc.Net, &span.Net)
 			}
 			if len(inc.Sql) > 0 {
@@ -8519,9 +8563,98 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 		// Set creation timestamp once per span (used for both min and full)
 		createdAt := time.Now()
 		
+		// Validate and normalize timestamps - convert from seconds to milliseconds if needed
+		// Log warnings for suspicious timestamps to help debug issues
+		now := time.Now().UnixMilli()
+		if inc.StartTS <= 0 {
+			LogWarn("Invalid start_ts (zero or negative)", map[string]interface{}{
+				"trace_id": inc.TraceID,
+				"span_id":  inc.SpanID,
+				"start_ts": inc.StartTS,
+			})
+			// Use current time as fallback
+			inc.StartTS = now
+		}
+		if inc.EndTS <= 0 {
+			LogWarn("Invalid end_ts (zero or negative)", map[string]interface{}{
+				"trace_id": inc.TraceID,
+				"span_id":  inc.SpanID,
+				"end_ts":   inc.EndTS,
+			})
+			// Use start_ts + duration if available, otherwise current time
+			if inc.StartTS > 0 && inc.Duration > 0 {
+				inc.EndTS = inc.StartTS + int64(inc.Duration)
+			} else {
+				inc.EndTS = now
+			}
+		}
+		
+		// Check for timestamps that are way in the future (more than 1 day ahead)
+		maxFutureTS := now + (24 * 60 * 60 * 1000)
+		if inc.StartTS > maxFutureTS {
+			LogWarn("Suspicious start_ts (more than 1 day in future)", map[string]interface{}{
+				"trace_id":     inc.TraceID,
+				"span_id":      inc.SpanID,
+				"start_ts":     inc.StartTS,
+				"start_ts_date": time.UnixMilli(inc.StartTS).Format("2006-01-02 15:04:05.000"),
+				"now":          now,
+				"now_date":     time.UnixMilli(now).Format("2006-01-02 15:04:05.000"),
+			})
+			// Clamp to current time
+			inc.StartTS = now
+		}
+		if inc.EndTS > maxFutureTS {
+			LogWarn("Suspicious end_ts (more than 1 day in future)", map[string]interface{}{
+				"trace_id":   inc.TraceID,
+				"span_id":    inc.SpanID,
+				"end_ts":     inc.EndTS,
+				"end_ts_date": time.UnixMilli(inc.EndTS).Format("2006-01-02 15:04:05.000"),
+				"now":        now,
+				"now_date":   time.UnixMilli(now).Format("2006-01-02 15:04:05.000"),
+			})
+			// Clamp to start_ts + duration if available, otherwise current time
+			if inc.StartTS > 0 && inc.Duration > 0 {
+				inc.EndTS = inc.StartTS + int64(inc.Duration)
+			} else {
+				inc.EndTS = now
+			}
+		}
+		
+		// Check for timestamps that are way in the past (before year 2000)
+		minReasonableTS := int64(946684800000) // Year 2000 in milliseconds
+		if inc.StartTS > 0 && inc.StartTS < minReasonableTS {
+			// This might be in seconds, let normalizeTimestamp handle it
+			// But log it for debugging
+			LogWarn("Suspicious start_ts (before year 2000, might be in seconds)", map[string]interface{}{
+				"trace_id":     inc.TraceID,
+				"span_id":      inc.SpanID,
+				"start_ts":     inc.StartTS,
+				"start_ts_date_if_ms": time.UnixMilli(inc.StartTS).Format("2006-01-02 15:04:05.000"),
+				"start_ts_date_if_sec": time.Unix(inc.StartTS, 0).Format("2006-01-02 15:04:05.000"),
+			})
+		}
+		
 		// Normalize timestamps - convert from seconds to milliseconds if needed
 		normalizedStartTS := normalizeTimestamp(inc.StartTS)
 		normalizedEndTS := normalizeTimestamp(inc.EndTS)
+		
+		// Final validation: ensure end_ts >= start_ts
+		if normalizedEndTS < normalizedStartTS {
+			LogWarn("Invalid timestamp order (end_ts < start_ts), correcting", map[string]interface{}{
+				"trace_id":        inc.TraceID,
+				"span_id":         inc.SpanID,
+				"start_ts":        normalizedStartTS,
+				"end_ts":          normalizedEndTS,
+				"duration_ms":     inc.Duration,
+				"calculated_diff": normalizedEndTS - normalizedStartTS,
+			})
+			// Use duration if available, otherwise set end_ts = start_ts + 1ms
+			if inc.Duration > 0 {
+				normalizedEndTS = normalizedStartTS + int64(inc.Duration)
+			} else {
+				normalizedEndTS = normalizedStartTS + 1
+			}
+		}
 		
 		min := map[string]interface{}{
 			"organization_id": orgID,
@@ -9054,6 +9187,13 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 			if frameworkVersion != "" {
 				full["framework_version"] = frameworkVersion
 			}
+			// Add W3C Trace Context fields if present
+			if inc.W3CTraceParent != nil && *inc.W3CTraceParent != "" {
+				full["w3c_traceparent"] = *inc.W3CTraceParent
+			}
+			if inc.W3CTraceState != nil && *inc.W3CTraceState != "" {
+				full["w3c_tracestate"] = *inc.W3CTraceState
+			}
 			writer.AddFull(full)
 			// Debug: Log that we're storing full span
 			log.Printf("[DEBUG] Storing full span: trace_id=%s, span_id=%s, sql_len=%d, stack_len=%d", 
@@ -9080,6 +9220,8 @@ func worker(inCh <-chan json.RawMessage, tb *TailBuffer, writer *ClickHouseWrite
 				Duration: inc.Duration,
 				CPUms:    inc.CPUms,
 				Status:   inc.Status,
+				W3CTraceParent: inc.W3CTraceParent,
+				W3CTraceState:  inc.W3CTraceState,
 			}
 			
 			// Parse network data if available
